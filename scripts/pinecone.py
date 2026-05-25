@@ -31,9 +31,6 @@ API_KEY = os.environ.get("PINECONE_API_KEY")
 HOST = os.environ.get("PINECONE_INDEX_HOST")
 MODEL = os.environ.get("PINECONE_EMBED_MODEL", "multilingual-e5-large")
 
-if not API_KEY or not HOST:
-    sys.exit("ERROR: PINECONE_API_KEY or PINECONE_INDEX_HOST not set in ~/.claude/.env")
-
 
 def _req(url, body=None, method="GET"):
     data = json.dumps(body).encode() if body else None
@@ -193,6 +190,8 @@ def cmd_delete(args):
 
 
 def main():
+    if not API_KEY or not HOST:
+        sys.exit("ERROR: PINECONE_API_KEY or PINECONE_INDEX_HOST not set in ~/.claude/.env")
     p = argparse.ArgumentParser(prog="pinecone", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
