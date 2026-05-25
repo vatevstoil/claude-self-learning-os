@@ -45,17 +45,8 @@ def project_from_cwd(cwd: str) -> str | None:
     return None
 
 
-def main() -> None:
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except Exception:
-        payload = {}
-
-    cwd = payload.get("cwd") or os.getcwd()
-    project = project_from_cwd(cwd)
-
-    alerts: list[str] = []
-
+def _legacy_alerts(alerts: list[str], project: str | None) -> None:
+    """Fallback logic for promotions + Boris when the queue module is unavailable."""
     # Check pending promotions count
     if PENDING_SUMMARY.exists():
         try:
@@ -98,7 +89,6 @@ def main() -> None:
     if project and GRAPHIFY_QUEUE.exists():
         try:
             q = json.loads(GRAPHIFY_QUEUE.read_text(encoding="utf-8"))
-            # map code-folder name (cwd) to wiki name is non-trivial here; match either
             for item in q.get("queued_for_llm", []):
                 proj = item.get("project", "")
                 if proj and (proj == project or project.replace(" ", "").lower() in proj.lower()
@@ -118,8 +108,6 @@ def main() -> None:
                 knorm = _norm(key)
                 if pnorm and (pnorm in knorm or knorm in pnorm):
                     cnt = info.get("count", 0)
-                    # ≥4 to cut false positives (Bulgarian "не" is ubiquitous);
-                    # full list stays in boris-candidates.json for review.
                     if cnt >= 4:
                         alerts.append(
                             f"🧭 {cnt} корекции в {project} наскоро — обмисли CLAUDE.md правило (Boris). "
@@ -129,7 +117,36 @@ def main() -> None:
         except Exception:
             pass
 
-    # Self-regulation health — only alert when degraded (grade C or worse, or regressions)
+
+def _format_queue_item(item: object) -> str | None:
+    """Format a QueueItem into a one-line alert string."""
+    item_type = item.type  # type: ignore[attr-defined]
+    project = item.project  # type: ignore[attr-defined]
+    desc = item.description  # type: ignore[attr-defined]
+
+    if item_type == "boris_rule":
+        return f"🧭 {desc} — обмисли CLAUDE.md правило (Boris)"
+    elif item_type == "promotion":
+        return f"📋 Pending promotion: {desc[:100]}"
+    elif item_type == "habit":
+        return f"🔁 {desc[:120]}"
+    elif item_type == "graphify":
+        return f"🧠 {desc}"
+    return None
+
+
+def main() -> None:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        payload = {}
+
+    cwd = payload.get("cwd") or os.getcwd()
+    project = project_from_cwd(cwd)
+
+    alerts: list[str] = []
+
+    # --- Self-regulation health (urgent, always checked first) ---
     if SELFREG_HEALTH.exists():
         try:
             h = json.loads(SELFREG_HEALTH.read_text(encoding="utf-8"))
@@ -146,8 +163,68 @@ def main() -> None:
         except Exception:
             pass
 
+    # --- Unified queue: top-2 queued items for this project ---
+    _queue_ok = False
+    try:
+        from self_improvement_queue import build_queue, filter_for_project  # type: ignore
+
+        all_items = build_queue()
+        project_items = filter_for_project(all_items, project or "")
+        queued = [i for i in project_items if i.status == "queued"]
+        for item in queued[:2]:
+            msg = _format_queue_item(item)
+            if msg:
+                alerts.append(msg)
+                # Track implicit feedback — auto-suppress after 5 unacknowledged surfaces
+                try:
+                    from suggestion_feedback import record_surfaced  # type: ignore
+                    record_surfaced(item.id)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        _queue_ok = True
+    except Exception:
+        pass
+
+    # --- Legacy fallback when queue module is unavailable ---
+    if not _queue_ok:
+        _legacy_alerts(alerts, project)
+
+    # --- Auto-recall: query project's Pinecone namespace (tracks Hebbian hits) ---
+    # Fires only when a project is active and credentials are available.
+    # Silent on any error — never blocks session start.
+    if project:
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+            env_path = Path.home() / ".claude" / ".env"
+            if env_path.exists():
+                import os as _os
+                for _line in env_path.read_text(encoding="utf-8").splitlines():
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        _os.environ.setdefault(_k.strip(), _v.strip())
+            from pinecone import query_and_track  # type: ignore
+            _ns = project.replace(" ", "_")
+            query_and_track(_ns, project, topk=3)  # track recall, results unused at start
+        except Exception:
+            pass
+
+    # --- Anticipation: surface the top predicted routine for THIS project (proactive) ---
+    if project:
+        try:
+            ant = json.loads((LOGS / "anticipations.json").read_text(encoding="utf-8"))
+            pnorm = _norm(project)
+            for proj_key, preds in (ant or {}).items():
+                if pnorm and (pnorm in _norm(proj_key) or _norm(proj_key) in pnorm) and preds:
+                    routine = preds[0].get("routine") or []
+                    if routine:
+                        alerts.append(f"🔮 В {project} обикновено: {' → '.join(routine)}")
+                    break
+        except Exception:
+            pass
+
     if alerts:
-        # Output goes to Claude as session context
         print("\n".join(alerts))
     sys.exit(0)
 

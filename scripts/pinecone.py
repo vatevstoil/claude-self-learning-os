@@ -113,6 +113,63 @@ def cmd_query(args):
         if txt:
             print(f"   {txt[:150]}")
 
+    # Hebbian recall tracking
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        from recall_tracker import log_hits
+        log_hits(args.namespace, matches)
+    except Exception:
+        pass
+
+
+def query_and_track(
+    namespace: str,
+    text: str,
+    topk: int = 7,
+    type_filter: str | None = None,
+) -> list[dict]:
+    """Query Pinecone and automatically track recall hits for Hebbian reinforcement.
+
+    Importable alternative to ``cmd_query`` for use in Python scripts that need
+    recall tracking without going through the CLI.  All hits are logged to
+    ``recall-tracker.json`` exactly as the CLI does.
+
+    Args:
+        namespace: Pinecone namespace to query.
+        text: Query text (will be embedded).
+        topk: Number of results to return (default 7).
+        type_filter: Optional comma-separated type filter (e.g. ``"learning,pattern"``).
+
+    Returns:
+        List of match dicts from Pinecone (each has ``id``, ``score``, ``metadata``).
+        Returns empty list on any error — never raises.
+    """
+    try:
+        vec = embed(text, is_query=True)
+        body: dict = {
+            "vector": vec,
+            "topK": topk,
+            "namespace": namespace,
+            "includeMetadata": True,
+        }
+        if type_filter:
+            types = [t.strip() for t in type_filter.split(",") if t.strip()]
+            body["filter"] = {"type": {"$in": types}}
+        resp = _req(f"https://{HOST}/query", body, method="POST")
+        matches = resp.get("matches", [])
+        if matches:
+            try:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent))
+                from recall_tracker import log_hits
+                log_hits(namespace, matches)
+            except Exception:
+                pass
+        return matches
+    except Exception:
+        return []
+
 
 def cmd_list(args):
     ns_encoded = quote(args.namespace, safe="")

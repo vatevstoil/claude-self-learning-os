@@ -42,6 +42,9 @@ HISTORY_PATH = LOGS_DIR / "queue-history.jsonl"
 EFFECTIVENESS_PATH = LOGS_DIR / "effectiveness.json"
 THRESHOLDS_PATH = LOGS_DIR / "thresholds.json"
 
+_DEFAULT_ANTICIPATIONS = Path.home() / ".claude" / "logs" / "anticipations.json"
+_DEFAULT_HABITS = Path.home() / ".claude" / "logs" / "habits.json"
+
 # Base value for the habit distinctiveness threshold
 _BASE_DISTINCTIVENESS = 150.0
 
@@ -257,6 +260,61 @@ def suggest_thresholds(precision: dict[str, float]) -> dict[str, float]:
     return {"habit_distinctiveness_min": threshold}
 
 
+def check_anticipation_accuracy(
+    anticipations_path: Path = _DEFAULT_ANTICIPATIONS,
+    habits_path: Path = _DEFAULT_HABITS,
+) -> float:
+    """Measure what fraction of anticipations matched actual top habits.
+
+    For each project in anticipations.json, takes the top prediction (first
+    entry) and checks whether any high-distinctiveness habit in habits.json
+    for that project has a routine overlapping >=50% with the prediction tokens.
+
+    Args:
+        anticipations_path: Path to anticipations.json
+            (shape: ``{project: [{routine: [str, ...], score: float}, ...]}``)
+        habits_path: Path to habits.json
+            (shape: ``[{project, routine, distinctiveness, count, ...}]``)
+
+    Returns:
+        Accuracy in [0.0, 1.0]. Returns 0.0 when no data is available.
+    """
+    try:
+        ant = json.loads(anticipations_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+    try:
+        habits_raw = json.loads(habits_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0.0
+
+    # Build index: project -> list of frozenset of routine tokens for high-distinctiveness habits
+    habit_index: dict[str, list[frozenset]] = {}
+    for h in habits_raw:
+        proj = h.get("project", "")
+        routine = h.get("routine", [])
+        if proj and routine and h.get("distinctiveness", 0) > 50:
+            habit_index.setdefault(proj, []).append(frozenset(routine))
+
+    matches = 0
+    total = 0
+    for project, preds in ant.items():
+        if not preds:
+            continue
+        total += 1
+        top_routine = frozenset(preds[0].get("routine", []))
+        if not top_routine:
+            continue
+        actual_routines = habit_index.get(project, [])
+        for actual in actual_routines:
+            overlap = len(top_routine & actual) / len(top_routine)
+            if overlap >= 0.5:
+                matches += 1
+                break
+
+    return round(matches / total, 3) if total else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -306,29 +364,35 @@ def main() -> None:
         # 7. Suggest thresholds
         thresholds = suggest_thresholds(precision)
 
-        # 8. Write effectiveness.json
+        # 8. Compute anticipation accuracy
+        ant_accuracy = check_anticipation_accuracy()
+        thresholds["anticipation_accuracy"] = ant_accuracy
+
+        # 9. Write effectiveness.json
         effectiveness = {
             "generated": datetime.now(timezone.utc).isoformat(),
             "precision_by_type": precision,
             "total_snapshots": len(history),
+            "anticipation_accuracy": ant_accuracy,
         }
         EFFECTIVENESS_PATH.write_text(
             json.dumps(effectiveness, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
-        # 9. Write thresholds.json
+        # 10. Write thresholds.json
         THRESHOLDS_PATH.write_text(
             json.dumps(thresholds, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
-        # 10. Print summary to stderr
+        # 11. Print summary to stderr
         print(
             f"[effectiveness_tracker] snapshots={len(history)} "
             f"queue_items={len(queue_items)} "
             f"precision={precision} "
-            f"thresholds={thresholds}",
+            f"thresholds={thresholds} "
+            f"anticipation_accuracy={ant_accuracy}",
             file=sys.stderr,
         )
 

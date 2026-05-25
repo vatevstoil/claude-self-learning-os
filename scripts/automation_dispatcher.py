@@ -30,6 +30,7 @@ LOGS_DIR = Path.home() / ".claude" / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 LOG_FILE = LOGS_DIR / "automation.log"
+HEALTH_PATH = LOGS_DIR / "health.json"
 FRESHNESS_OUT = LOGS_DIR / "freshness.json"
 PROMOTIONS_OUT = LOGS_DIR / "promotions-pending.md"
 CROSSLINKS_OUT = LOGS_DIR / "cross-links-pending.md"
@@ -77,6 +78,34 @@ def run_safe(script_path: Path, args: list[str], timeout: int = 300) -> bool:
     except Exception as exc:
         log.error("%s: ERROR %s", name, exc)
         return False
+
+
+def write_health(run_type: str, results: dict[str, bool]) -> None:
+    """Write automation health summary to health.json.
+
+    Args:
+        run_type: "daily" | "weekly" | "dreaming"
+        results: Mapping of task_name -> success bool from run_safe calls.
+    """
+    failures = [name for name, ok in results.items() if not ok]
+    data = {
+        "last_run": datetime.now().isoformat(timespec="seconds"),
+        "run_type": run_type,
+        "tasks_total": len(results),
+        "tasks_failed": len(failures),
+        "failures": failures,
+        "status": "OK" if not failures else "DEGRADED",
+    }
+    try:
+        HEALTH_PATH.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as exc:
+        log.error("write_health failed: %s", exc)
+    if failures:
+        log.warning("Health DEGRADED — failed tasks: %s", failures)
+    else:
+        log.info("Health OK — all %d tasks succeeded", len(results))
 
 
 def write_pending_summary():
@@ -140,45 +169,42 @@ def write_pending_summary():
 
 def daily_tasks():
     log.info("=== DAILY RUN START ===")
-    run_safe(SCRIPTS_DIR / "wiki_freshness_check.py",
+    results: dict[str, bool] = {}
+    results["wiki_freshness"] = run_safe(SCRIPTS_DIR / "wiki_freshness_check.py",
              ["--out", str(FRESHNESS_OUT), "--threshold", "14"])
     write_pending_summary()
-    # Self-regulation health monitor (watch the watchers)
-    run_safe(SCRIPTS_DIR / "selfreg_monitor.py", [])
+    results["habit_miner"] = run_safe(SCRIPTS_DIR / "habit_miner.py", ["--days", "2"], timeout=180)
+    results["selfreg_monitor"] = run_safe(SCRIPTS_DIR / "selfreg_monitor.py", [])
+    write_health("daily", results)
     log.info("=== DAILY RUN END ===")
 
 
 def weekly_tasks():
     log.info("=== WEEKLY RUN START ===")
-    # Daily checks too
-    run_safe(SCRIPTS_DIR / "wiki_freshness_check.py",
+    results: dict[str, bool] = {}
+    results["wiki_freshness"] = run_safe(SCRIPTS_DIR / "wiki_freshness_check.py",
              ["--out", str(FRESHNESS_OUT), "--threshold", "14"])
-    # Promotions — detect cross-project patterns (clean signal: label-stripped jaccard)
-    run_safe(SCRIPTS_DIR / "learning_promoter.py",
+    results["learning_promoter"] = run_safe(SCRIPTS_DIR / "learning_promoter.py",
              ["--out", str(PROMOTIONS_OUT)])
-    # Wiki contract compliance report (active wikis only)
-    run_safe(SCRIPTS_DIR / "wiki_lint.py", [])
-    # Self-regulation actuator — auto-apply high-confidence (Tier 1), queue the rest (Tier 2)
-    run_safe(SCRIPTS_DIR / "promotion_auto.py", [])
-    # Auto-build missing knowledge graphs (structural); queue stale ones for LLM (never overwrite quality)
-    run_safe(SCRIPTS_DIR / "auto_graphify.py", ["--max", "5"])
-    # Refresh ecosystem super-graph inventory from ground truth (preserves curated edges)
-    run_safe(SCRIPTS_DIR / "super_graph_regen.py", [])
-    # Cross-links
-    run_safe(SCRIPTS_DIR / "cross_project_promoter.py",
+    results["wiki_lint"] = run_safe(SCRIPTS_DIR / "wiki_lint.py", [])
+    results["promotion_auto"] = run_safe(SCRIPTS_DIR / "promotion_auto.py", [])
+    results["auto_graphify"] = run_safe(SCRIPTS_DIR / "auto_graphify.py", ["--max", "5"])
+    results["super_graph_regen"] = run_safe(SCRIPTS_DIR / "super_graph_regen.py", [])
+    results["cross_project_promoter"] = run_safe(SCRIPTS_DIR / "cross_project_promoter.py",
              ["--out", str(CROSSLINKS_OUT), "--since-days", "7"])
-    # TTL cleanup
-    run_safe(SCRIPTS_DIR / "pinecone_cleanup_expired.py",
+    results["ai_video_check"] = run_safe(SCRIPTS_DIR / "ai_video_check_new.py", [])
+    results["pinecone_cleanup"] = run_safe(SCRIPTS_DIR / "pinecone_cleanup_expired.py",
              ["--all-namespaces", "--apply"])
+    results["semantic_merge"] = run_safe(SCRIPTS_DIR / "semantic_merge.py",
+             ["--all-namespaces", "--apply", "--threshold", "0.95"], timeout=300)
+    results["salience"] = run_safe(SCRIPTS_DIR / "salience.py", ["--days", "7"], timeout=120)
     write_pending_summary()
-    # Continuous L4 sync — embed new/changed learnings/decisions/patterns/meta into Pinecone (incremental)
-    run_safe(SCRIPTS_DIR / "knowledge_sync.py", [])
-    # Agentic OS backbone — refresh domain registry (self-maintaining: new skills auto-appear)
-    run_safe(SCRIPTS_DIR / "agentic_os_registry.py", [])
-    # ROI layer — value of time saved by automations (reads automation.log)
-    run_safe(SCRIPTS_DIR / "roi_tracker.py", ["--days", "30"])
-    # Self-regulation health monitor — audits the run that just happened, tracks trend
-    run_safe(SCRIPTS_DIR / "selfreg_monitor.py", [])
+    results["improvement_queue"] = run_safe(SCRIPTS_DIR / "self_improvement_queue.py", [], timeout=60)
+    results["knowledge_sync"] = run_safe(SCRIPTS_DIR / "knowledge_sync.py", [])
+    results["agentic_os_registry"] = run_safe(SCRIPTS_DIR / "agentic_os_registry.py", [])
+    results["roi_tracker"] = run_safe(SCRIPTS_DIR / "roi_tracker.py", ["--days", "30"])
+    results["selfreg_monitor"] = run_safe(SCRIPTS_DIR / "selfreg_monitor.py", [])
+    write_health("weekly", results)
     log.info("=== WEEKLY RUN END ===")
 
 
@@ -187,10 +213,20 @@ def dreaming_tasks():
     See: J:\\Obsidian Resurch\\Claude Code Resurch\\wiki\\summaries\\Claude-OS-Dashboard-Jack.md
     """
     log.info("=== DREAMING RUN START ===")
-    # Conversation/skill analysis за последните 7 дни → ~/.claude/reports/dreaming-{date}.md
-    run_safe(SCRIPTS_DIR / "stage3_dreaming.py", ["--days", "7"], timeout=600)
-    # Weekly skills compliance audit → ~/.claude/reports/skills-audit-{date}.md
-    run_safe(SCRIPTS_DIR / "skills_audit.py", [], timeout=120)
+    results: dict[str, bool] = {}
+    results["stage3_dreaming"] = run_safe(SCRIPTS_DIR / "stage3_dreaming.py", ["--days", "7"], timeout=600)
+    results["skills_audit"] = run_safe(SCRIPTS_DIR / "skills_audit.py", [], timeout=120)
+    results["habit_miner"] = run_safe(SCRIPTS_DIR / "habit_miner.py", ["--days", "14"], timeout=300)
+    results["habit_ledger"] = run_safe(SCRIPTS_DIR / "habit_ledger.py", [], timeout=120)
+    results["habit_to_skill"] = run_safe(SCRIPTS_DIR / "habit_to_skill.py", [], timeout=60)
+    results["habit_accept_queue"] = run_safe(SCRIPTS_DIR / "habit_to_skill.py", ["--process-accepted"], timeout=60)
+    results["boris_draft"] = run_safe(SCRIPTS_DIR / "boris_draft.py", [], timeout=60)
+    results["improvement_queue"] = run_safe(SCRIPTS_DIR / "self_improvement_queue.py", [], timeout=60)
+    results["effectiveness_tracker"] = run_safe(SCRIPTS_DIR / "effectiveness_tracker.py", [], timeout=60)
+    results["anticipate"] = run_safe(SCRIPTS_DIR / "anticipate.py", [], timeout=60)
+    # Hebbian consolidation — extend TTL for frequently recalled memories (salience-boosted)
+    results["hebbian"] = run_safe(SCRIPTS_DIR / "hebbian_consolidation.py", ["--apply"], timeout=180)
+    write_health("dreaming", results)
     log.info("=== DREAMING RUN END ===")
 
 

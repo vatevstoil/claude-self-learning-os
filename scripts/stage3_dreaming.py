@@ -194,6 +194,7 @@ def analyze_jsonl_files(days: int):
     usage_by_model = defaultdict(lambda: defaultdict(int))   # family -> usage totals
     session_peak = defaultdict(int)                           # sessionId -> peak context size (1 turn)
     assistant_msgs = 0
+    tool_seqs_by_session: dict = {}
 
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
@@ -227,6 +228,8 @@ def analyze_jsonl_files(days: int):
                         # Cost / session usage (assistant records carry usage)
                         if rec.get("type") == "assistant":
                             msg = rec.get("message", {})
+                            # sid must be defined for BOTH usage and tool-collection blocks
+                            sid = rec.get("sessionId", str(jsonl_file))
                             u = msg.get("usage", {}) or {}
                             if u:
                                 fam = model_family(msg.get("model", ""))
@@ -234,7 +237,6 @@ def analyze_jsonl_files(days: int):
                                 for k in ("input_tokens", "output_tokens",
                                           "cache_creation_input_tokens", "cache_read_input_tokens"):
                                     usage_by_model[fam][k] += u.get(k, 0) or 0
-                                sid = rec.get("sessionId", str(jsonl_file))
                                 # peak context = largest single-turn window (input + cached),
                                 # NOT a sum of cache re-reads (which over-counts massively)
                                 ctx = ((u.get("input_tokens", 0) or 0)
@@ -242,6 +244,45 @@ def analyze_jsonl_files(days: int):
                                        + (u.get("cache_creation_input_tokens", 0) or 0))
                                 if ctx > session_peak[sid]:
                                     session_peak[sid] = ctx
+                            # Collect tool sequences for habit mining (single JSONL pass)
+                            try:
+                                from habit_miner import tool_signature as _tool_sig, GAP_MINUTES as _GAP
+                            except Exception:
+                                def _tool_sig(n, i=None): return n  # type: ignore[misc]
+                                _GAP = 20
+                            content_for_tools = msg.get("content") or []
+                            ts_for_tools = rec.get("timestamp", "")
+                            tools_this_turn = [
+                                _tool_sig(item["name"], item.get("input") or {})
+                                for item in content_for_tools
+                                if isinstance(item, dict)
+                                and item.get("type") == "tool_use"
+                                and item.get("name", "")
+                            ]
+                            if tools_this_turn:
+                                if sid not in tool_seqs_by_session:
+                                    tool_seqs_by_session[sid] = {
+                                        "project": project_name, "tools": [], "last_seen": "",
+                                        "_last_ts": None}
+                                sess = tool_seqs_by_session[sid]
+                                # Insert __BREAK__ only on idle gaps > GAP_MINUTES
+                                # (design change 2 — NOT after every assistant turn)
+                                last_ts_str = sess.get("_last_ts")
+                                if last_ts_str and ts_for_tools:
+                                    try:
+                                        last_dt = datetime.fromisoformat(
+                                            last_ts_str.replace("Z", "+00:00"))
+                                        cur_dt = datetime.fromisoformat(
+                                            ts_for_tools.replace("Z", "+00:00"))
+                                        gap_secs = (cur_dt - last_dt).total_seconds()
+                                        if gap_secs > _GAP * 60 and sess["tools"]:
+                                            sess["tools"].append("__BREAK__")
+                                    except Exception:
+                                        pass
+                                sess["tools"].extend(tools_this_turn)
+                                sess["_last_ts"] = ts_for_tools
+                                if ts_for_tools > sess["last_seen"]:
+                                    sess["last_seen"] = ts_for_tools
                             continue
 
                         text = extract_user_text(rec)
@@ -281,6 +322,7 @@ def analyze_jsonl_files(days: int):
         "usage_by_model": {k: dict(v) for k, v in usage_by_model.items()},
         "session_peak": dict(session_peak),
         "assistant_msgs": assistant_msgs,
+        "tool_seqs_by_session": tool_seqs_by_session,
     }
 
 
@@ -613,6 +655,19 @@ def main():
     print(f"[dreaming] Analyzing last {args.days} days...", file=sys.stderr)
 
     data = analyze_jsonl_files(args.days)
+
+    # Habit mining — reuse existing JSONL pass data (no double-walk)
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from habit_miner import mine_habits, save_habits
+        tool_seqs = data.get("tool_seqs_by_session", {})
+        if tool_seqs:
+            habits = mine_habits(tool_seqs)
+            save_habits(habits)
+            print(f"[dreaming] {len(habits)} habit candidates saved", file=sys.stderr)
+    except Exception as _he:
+        print(f"[dreaming] habit_miner error (non-fatal): {_he}", file=sys.stderr)
+
     term_counter = data["term_counter"]
     action_counter = data["action_counter"]
     project_activity = data["project_activity"]
@@ -693,7 +748,7 @@ def main():
     except Exception:
         pass
     print(f"Wrote: {out_path}", file=sys.stderr)
-    print(f"Sessions: {sessions}, Prompts: {prompts}, Corrections: {len(corrections)}", file=sys.stderr)
+    print(f"Sessions: {data['sessions']}, Prompts: {data['prompts']}, Corrections: {len(corrections)}", file=sys.stderr)
     print(f"Skill candidates: {len(candidates)}, Stale skills: {len(stale)}", file=sys.stderr)
 
 

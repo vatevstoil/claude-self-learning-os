@@ -23,6 +23,7 @@ PLACEHOLDERS = {
 SECRETS = {
     "PINECONE_API_KEY": "Your Pinecone API key (console.pinecone.io)",
     "PINECONE_INDEX_HOST": "Your Pinecone index host (e.g. memory-xxxx.svc.region.pinecone.io)",
+    "PINECONE_EMBED_MODEL": "Embedding model (press Enter to keep default: multilingual-e5-large)",
 }
 
 
@@ -63,6 +64,15 @@ def main() -> None:
         env_lines.append(f"{key}={ask(desc, '')}")
     (ROOT / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
     print(f"\nWrote .env. Next: run install.ps1 (Windows) or install.sh (macOS/Linux).")
+    print("\n--- Brain-inspired OS (habit mining + Hebbian memory) ---")
+    print("These scripts run automatically after scheduling:")
+    print("  habit_miner.py     — mines tool sequences from session logs")
+    print("  hebbian_consolidation.py — extends Pinecone TTL for recalled memories")
+    print("  self_improvement_queue.py — unified ranked improvement inbox")
+    print("  anticipate.py      — predicts next routine per project")
+    print("  effectiveness_tracker.py — grades suggestions, auto-tunes thresholds")
+    print("The install script registers 3 scheduled tasks (daily/weekly/dreaming).")
+    print("Session logs are read from ~/.claude/projects/*/  (auto-discovered).")
 
 
 if __name__ == "__main__":

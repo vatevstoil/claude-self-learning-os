@@ -25,6 +25,7 @@ from typing import Any
 _DEFAULT_LEDGER = Path.home() / ".claude" / "logs" / "habit-ledger.json"
 _DEFAULT_HABITS = Path.home() / ".claude" / "logs" / "habits.json"
 _DEFAULT_OUT_DIR = Path.home() / ".claude" / "logs" / "skill-drafts"
+_DEFAULT_ACCEPTED_HABITS = Path.home() / ".claude" / "logs" / "accepted-habits.json"
 
 # Guard: never write inside skills/ — enforce at module level
 _FORBIDDEN_PREFIX = Path.home() / ".claude" / "skills"
@@ -249,16 +250,185 @@ def write_skill_drafts(
 # ---------------------------------------------------------------------------
 
 
+def process_accepted_habits(
+    accepted_habits_path: Path = _DEFAULT_ACCEPTED_HABITS,
+    ledger_path: Path = _DEFAULT_LEDGER,
+    habits_path: Path = _DEFAULT_HABITS,
+    out_dir: Path = _DEFAULT_OUT_DIR,
+) -> list[Path]:
+    """Process accepted-habits.json queue and scaffold approved habits.
+
+    Reads the list of accepted item IDs, finds matching entries in the habit
+    ledger and habits.json, generates skill scaffolds for each, then clears
+    the accepted-habits.json queue.
+
+    Item IDs have format ``habit-{project}-{routine-slug}``. Matching is done
+    by checking whether the item_id contains the ledger entry's slug or
+    ``habit_id`` field.
+
+    Args:
+        accepted_habits_path: Path to accepted-habits.json queue file.
+        ledger_path: Path to habit-ledger.json.
+        habits_path: Path to habits.json.
+        out_dir: Root directory for skill draft folders.
+
+    Returns:
+        List of Path objects for successfully written SKILL.md files.
+    """
+    accepted_habits_path = Path(accepted_habits_path)
+
+    # Load the accepted queue
+    try:
+        item_ids: list[str] = json.loads(
+            accepted_habits_path.read_text(encoding="utf-8")
+        )
+        if not isinstance(item_ids, list):
+            item_ids = []
+    except Exception:
+        item_ids = []
+
+    if not item_ids:
+        return []
+
+    # Load ledger
+    try:
+        ledger_text = Path(ledger_path).read_text(encoding="utf-8")
+        ledger: dict[str, Any] = json.loads(ledger_text)
+        if not isinstance(ledger, dict):
+            ledger = {}
+    except Exception:
+        ledger = {}
+
+    # Load habits list
+    try:
+        habits_text = Path(habits_path).read_text(encoding="utf-8")
+        habits_raw = json.loads(habits_text)
+        habits: list[dict[str, Any]] = habits_raw if isinstance(habits_raw, list) else []
+    except Exception:
+        habits = []
+
+    def _make_key(h: dict[str, Any]) -> str:
+        proj = h.get("project", "")
+        routine = h.get("routine") or []
+        tokens = [str(t) for t in routine]
+        return f"{proj}|{'>'.join(tokens)}"
+
+    habits_index: dict[str, dict[str, Any]] = {_make_key(h): h for h in habits}
+
+    # Safety guard — same as write_skill_drafts
+    out_dir = Path(out_dir)
+    try:
+        resolved = out_dir.resolve()
+        forbidden = _FORBIDDEN_PREFIX.resolve()
+        if resolved == forbidden or forbidden in resolved.parents:
+            print(
+                f"[habit_to_skill] ERROR: out_dir {out_dir} is inside {_FORBIDDEN_PREFIX} — aborted",
+                file=sys.stderr,
+            )
+            return []
+    except Exception:
+        pass
+
+    written: list[Path] = []
+
+    for item_id in item_ids:
+        item_id_lower = item_id.lower()
+
+        # Find matching ledger key: item_id contains the ledger key's slug or habit_id
+        matched_habit: dict[str, Any] | None = None
+        for ledger_key, entry in ledger.items():
+            if not isinstance(entry, dict):
+                continue
+            # Match by ledger key substrings within item_id
+            ledger_key_lower = ledger_key.lower()
+            habit_id_field = str(entry.get("habit_id", "")).lower()
+            slug_field = str(entry.get("slug", "")).lower()
+            if (ledger_key_lower in item_id_lower
+                    or (habit_id_field and habit_id_field in item_id_lower)
+                    or (slug_field and slug_field in item_id_lower)):
+                matched_habit = habits_index.get(ledger_key)
+                break
+
+        if matched_habit is None:
+            print(
+                f"[habit_to_skill] warning: no ledger/habit match for accepted item '{item_id}'",
+                file=sys.stderr,
+            )
+            continue
+
+        slug = slugify_routine(
+            matched_habit.get("project", ""), matched_habit.get("routine") or []
+        )
+        if not slug:
+            continue
+
+        dest_dir = out_dir / slug
+        dest_file = dest_dir / "SKILL.md"
+
+        # Skip if already scaffolded
+        if dest_file.exists():
+            print(
+                f"[habit_to_skill] skipping '{item_id}' — already scaffolded at {dest_file}",
+                file=sys.stderr,
+            )
+            written.append(dest_file)
+            continue
+
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            content = generate_skill_md(matched_habit)
+            dest_file.write_text(content, encoding="utf-8")
+            written.append(dest_file)
+            print(f"[habit_to_skill] scaffolded '{item_id}' -> {dest_file}", file=sys.stderr)
+        except Exception as exc:
+            print(
+                f"[habit_to_skill] warning: could not write {dest_file}: {exc}",
+                file=sys.stderr,
+            )
+
+    # Clear the accepted-habits queue
+    try:
+        accepted_habits_path.write_text("[]", encoding="utf-8")
+    except Exception as exc:
+        print(
+            f"[habit_to_skill] warning: could not clear accepted-habits queue: {exc}",
+            file=sys.stderr,
+        )
+
+    return written
+
+
 def main() -> None:
     """Run with default paths; report draft count to stderr."""
-    written = write_skill_drafts(
-        ledger_path=_DEFAULT_LEDGER,
-        habits_path=_DEFAULT_HABITS,
-        out_dir=_DEFAULT_OUT_DIR,
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Generate SKILL.md drafts from habit ledger"
     )
-    print(f"[habit_to_skill] skill drafts written: {len(written)}", file=sys.stderr)
-    for path in written:
-        print(f"  {path}", file=sys.stderr)
+    parser.add_argument(
+        "--process-accepted",
+        action="store_true",
+        help="Process accepted-habits.json queue and scaffold approved habits",
+    )
+    args = parser.parse_args()
+
+    if args.process_accepted:
+        written = process_accepted_habits()
+        print(
+            f"[habit_to_skill] processed accepted habits, skill drafts written: {len(written)}",
+            file=sys.stderr,
+        )
+        for path in written:
+            print(f"  {path}", file=sys.stderr)
+    else:
+        written = write_skill_drafts(
+            ledger_path=_DEFAULT_LEDGER,
+            habits_path=_DEFAULT_HABITS,
+            out_dir=_DEFAULT_OUT_DIR,
+        )
+        print(f"[habit_to_skill] skill drafts written: {len(written)}", file=sys.stderr)
+        for path in written:
+            print(f"  {path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

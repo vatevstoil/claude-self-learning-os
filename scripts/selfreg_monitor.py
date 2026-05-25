@@ -45,6 +45,7 @@ HISTORY_OUT = LOGS / "selfreg-history.jsonl"
 DIGEST_OUT = LOGS / "selfreg-digest.txt"
 SETTINGS = CLAUDE / "settings.json"
 DASHBOARD = CLAUDE / "scripts" / "agentic_os_dashboard.py"
+DISPATCHER_HEALTH = LOGS / "health.json"
 
 EXPECTED_TASKS = ["ClaudeAutomation_Daily", "ClaudeAutomation_Weekly", "ClaudeAutomation_Dreaming"]
 # Scripts whose non-zero exit is SEMANTIC, not a failure (freshness exits 1 when stale)
@@ -195,6 +196,35 @@ def check_hygiene() -> tuple[int, list[str]]:
     return score, issues
 
 
+# --------------------------------------------------------------------------- dispatcher
+def check_dispatcher() -> tuple[int, list[str]]:
+    """Check dispatcher health.json for recent run status."""
+    issues: list[str] = []
+    d = _json(DISPATCHER_HEALTH)
+    if not d:
+        return 70, ["health.json missing (dispatcher never ran or too old)"]
+
+    status = d.get("status", "UNKNOWN")
+    failures = d.get("failures", [])
+    last_run_raw = d.get("last_run", "")
+
+    # Check recency — health.json should be written at least daily
+    try:
+        last_run = datetime.fromisoformat(last_run_raw)
+        age_hours = (datetime.now() - last_run).total_seconds() / 3600
+        if age_hours > 50:  # 48h + 2h slack
+            issues.append(f"health.json stale ({int(age_hours)}h old — dispatcher not running?)")
+    except Exception:
+        issues.append("health.json has invalid last_run timestamp")
+
+    if status == "DEGRADED":
+        for f in failures[:3]:
+            issues.append(f"dispatcher: {f} failed last run")
+
+    score = 100 if not issues else (70 if status == "OK" else max(0, 100 - 30 * len(issues)))
+    return score, issues
+
+
 # --------------------------------------------------------------------------- main
 def grade(score: int) -> str:
     return ("A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70
@@ -209,11 +239,12 @@ def run(do_print: bool) -> dict:
     fresh_s, fresh_d = check_freshness()
     lint_s, lint_d = check_lint()
     hyg_s, hyg_i = check_hygiene()
+    disp_s, disp_i = check_dispatcher()
 
     # Weighted overall: errors + cron + hygiene are most critical
     overall = round(
-        0.20 * cron_s + 0.15 * runs_s + 0.25 * err_s
-        + 0.13 * fresh_s + 0.07 * lint_s + 0.20 * hyg_s
+        0.20 * cron_s + 0.15 * runs_s + 0.20 * err_s
+        + 0.13 * fresh_s + 0.07 * lint_s + 0.15 * hyg_s + 0.10 * disp_s
     )
 
     snapshot = {
@@ -224,8 +255,10 @@ def run(do_print: bool) -> dict:
         "components": {
             "cron": cron_s, "runs": runs_s, "errors": err_s,
             "freshness": fresh_s, "lint": lint_s, "hygiene": hyg_s,
+            "dispatcher": disp_s,
         },
-        "issues": {"cron": cron_i, "runs": runs_i, "errors": err_i, "hygiene": hyg_i},
+        "issues": {"cron": cron_i, "runs": runs_i, "errors": err_i, "hygiene": hyg_i,
+                   "dispatcher": disp_i},
         "freshness": fresh_d,
         "lint": lint_d,
         "pending_promotions": pending_count(),
@@ -264,7 +297,7 @@ def run(do_print: bool) -> dict:
         pass
 
     # Digest (compact, for SessionStart) — hygiene issues are security/deps, surface first
-    all_issues = hyg_i + cron_i + runs_i + err_i
+    all_issues = hyg_i + cron_i + runs_i + err_i + disp_i
     digest_lines = [
         f"selfreg health: {snapshot['grade']} ({overall}/100) | "
         f"stale {fresh_d['stale']}/{fresh_d['total']} | lint {lint_d.get('avg_score')}% | "

@@ -33,8 +33,16 @@ effort. It runs on Windows via Task Scheduler; the brain is Claude Code.
 │  domains → tasks → skills → automations  (agentic_os_registry)     │
 │  observability dashboard (agentic_os_dashboard.py + agentic-os.bat)│
 │  ROI tracking (roi_tracker) · dreaming 7/8 dims (stage3_dreaming)  │
+├─ BRAIN-INSPIRED OS ── how it LEARNS (v1-v5, 2026-05-25) ──────────┤
+│  Declarative: recall_tracker → hebbian_consolidation (TTL boost)   │
+│  Procedural:  habit_miner → habit_ledger → habit_to_skill (drafts) │
+│  Attention:   self_improvement_queue (ranked) → session_start_brief│
+│  Metacognition: effectiveness_tracker (auto-tune) · anticipate     │
+│  Salience: salience.py tags high-stakes → TTL boost in Hebbian     │
+│  Boris loop: corrections → boris_draft.py → CLAUDE.md rule drafts  │
+│  Cross-project: _mine_cross_project() aggregates universal habits  │
 ├─ 4-LAYER MEMORY ───── what the system KNOWS ──────────────────────┤
-│  L4 Pinecone     cross-session recall (419+ curated entries)       │
+│  L4 Pinecone     cross-session recall (470+ curated entries)       │
 │  L3 Obsidian     wikis: concepts, summaries, learnings, ADRs       │
 │  L2b GitNexus    "what breaks if I change X" (impact analysis)     │
 │  L2a Graphify    knowledge_graph.json (~70x token savings)         │
@@ -42,6 +50,7 @@ effort. It runs on Windows via Task Scheduler; the brain is Claude Code.
 ├─ SELF-REGULATION ──── how it stays HEALTHY (the immune system) ───┤
 │  detect (freshness/lint) → act (promote/graphify/sync) →           │
 │  verify (backups/dedup) → MONITOR (selfreg_monitor grades itself)  │
+│  health.json: dispatcher status after every run (OK/DEGRADED)      │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,9 +66,9 @@ Three scheduled tasks run `automation_dispatcher.py` (under `pythonw.exe`, UTF-8
 
 | Task | When | Runs |
 |------|------|------|
-| **ClaudeAutomation_Daily** | 09:00 | `wiki_freshness_check` → `selfreg_monitor` |
-| **ClaudeAutomation_Weekly** | Sun 10:00 | freshness → `learning_promoter` → `wiki_lint` → `promotion_auto` → `auto_graphify` → `super_graph_regen` → `cross_project_promoter` → `ai_video_check_new` → `pinecone_cleanup_expired` → **`knowledge_sync`** → `agentic_os_registry` → `roi_tracker` → `selfreg_monitor` |
-| **ClaudeAutomation_Dreaming** | Sat 11:00 | `stage3_dreaming` (7-day) → `skills_audit` |
+| **ClaudeAutomation_Daily** | 09:00 | `wiki_freshness_check` → `habit_miner --days 2` → `selfreg_monitor` |
+| **ClaudeAutomation_Weekly** | Sun 10:00 | freshness → `learning_promoter` → `wiki_lint` → `promotion_auto` → `auto_graphify` → `super_graph_regen` → `cross_project_promoter` → `pinecone_cleanup_expired` → `semantic_merge` → `salience` → `self_improvement_queue` → **`knowledge_sync`** → `agentic_os_registry` → `roi_tracker` → `selfreg_monitor` |
+| **ClaudeAutomation_Dreaming** | Sat 11:00 | `stage3_dreaming` (14-day) → `skills_audit` → `habit_miner --days 14` → `habit_ledger` → `habit_to_skill` → `habit_to_skill --process-accepted` → `boris_draft` → `self_improvement_queue` → `effectiveness_tracker` → `anticipate` → `hebbian_consolidation --apply` |
 
 Plus two **hooks** (in `~/.claude/settings.json`):
 - **Stop hook** → `auto_pinecone_save.py` — saves session learnings to Pinecone (secret-guarded, per-project namespace).
@@ -89,7 +98,19 @@ Manual override / catch-up: `python ~/.claude/scripts/automation_dispatcher.py {
 | `roi_tracker.py` | MONITOR — value of time saved by automations (config: `roi-config.json`) |
 | `stage3_dreaming.py` | LEARN — 7/8-dimension weekly analysis → 4 high-leverage actions + `boris-candidates.json` |
 | `skills_audit.py` | MONITOR — skills compliance/health audit |
-| `selfreg_monitor.py` | MONITOR — grades the regulator (cron/runs/errors/freshness/lint/**hygiene**); trend + regressions |
+| `selfreg_monitor.py` | MONITOR — grades the regulator (cron/runs/errors/freshness/lint/hygiene/**dispatcher**); trend + regressions |
+| `recall_tracker.py` | BRAIN — log every Pinecone query hit (id→hit count, last_recalled) for Hebbian reinforcement |
+| `habit_miner.py` | BRAIN — mine JSONL transcripts → frequent tool-sequence n-grams → `habits.json` (IDF distinctiveness, reward ratio) |
+| `habit_ledger.py` | BRAIN — graduation ladder: detected→suggested_skill; cross-project detection |
+| `habit_to_skill.py` | BRAIN — scaffold SKILL.md drafts from graduated habits; `--process-accepted` processes accepted queue |
+| `hebbian_consolidation.py` | BRAIN — extend Pinecone TTL for recalled+salience-boosted memories |
+| `self_improvement_queue.py` | BRAIN — unified ranked improvement inbox (boris + habits + promotions + graphify) |
+| `suggestion_feedback.py` | BRAIN — dismiss/accept queue items; auto-suppress after 5 ignores; accept habit→queues skill scaffold |
+| `effectiveness_tracker.py` | BRAIN — grade suggestions, auto-tune thresholds, measure anticipation accuracy |
+| `anticipate.py` | BRAIN — predict next routine per project → `anticipations.json` (surfaced at session start 🔮) |
+| `salience.py` | BRAIN — tag high-stakes events (security/money/prod) → `salience.json` → Hebbian TTL boost |
+| `boris_draft.py` | BRAIN — generate CLAUDE.md rule drafts from corrections (ask-first, never auto-writes) |
+| `semantic_merge.py` | BRAIN — cosine>0.95 dedup of Pinecone vectors (weekly, keeps strongest) |
 | `auto_pinecone_save.py` | CAPTURE — Stop-hook session-learning saver |
 | `session_start_brief.py` | SURFACE — SessionStart alerts (incl. Boris nudges) |
 | `pinecone.py` | TOOL — CLI: `save|query|list|delete <ns>` (auto-sanitizes ns) |
@@ -98,6 +119,11 @@ Manual override / catch-up: `python ~/.claude/scripts/automation_dispatcher.py {
 Signal files in `~/.claude/logs/`: `automation.log`, `freshness.json`, `selfreg-health.json`,
 `selfreg-history.jsonl`, `roi.json`, `graphify-queue.json`, `boris-candidates.json`,
 `promotions-pending.md`, `bulk_import_manifest.json`.
+
+Brain-OS signal files: `habits.json`, `habit-ledger.json`, `improvement-queue.json`,
+`suggestion-feedback.json`, `accepted-habits.json`, `anticipations.json`,
+`effectiveness.json`, `thresholds.json`, `salience.json`, `recall-tracker.json`,
+`health.json`, `skill-drafts/`, `boris-drafts/`.
 
 ---
 

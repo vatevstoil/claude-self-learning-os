@@ -4,7 +4,7 @@ tags: [domain::meta, project::all, status::done, brain-inspired, habits, consoli
 created: 2026-05-25
 last_updated: 2026-05-25
 cross_refs: [[[SYSTEM_GUIDE]], [[SELF_REGULATION]], [[AGENTIC_OS]]]
-status_note: "IMPLEMENTED v1+v2+v3+v4 2026-05-25. v1: 4 pillars (recall_tracker, habit_miner, self_improvement_queue, hebbian_consolidation). v2: tool-signature+IDF+reward (noise 2961->14), habit_ledger, boris_draft, semantic_merge. v3: habit_to_skill, suggestion_feedback, effectiveness_tracker, anticipate, salience, skill-match fix. v4 GAP-CLOSE: salience->TTL wired, dispatcher health.json, implicit feedback auto-suppress, 9 project CLAUDE.md deployed. 114/114 tests."
+status_note: "IMPLEMENTED v1+v2+v3+v4+v5 2026-05-25. v1: 4 pillars (recall_tracker, habit_miner, self_improvement_queue, hebbian_consolidation). v2: tool-signature+IDF+reward (noise 2961->14), habit_ledger, boris_draft, semantic_merge. v3: habit_to_skill, suggestion_feedback, effectiveness_tracker, anticipate, salience, skill-match fix. v4 GAP-CLOSE: salience->TTL wired, dispatcher health.json, implicit feedback auto-suppress, 9 project CLAUDE.md deployed. v5: cross-project habit transfer (_mine_cross_project), MCP recall (query_and_track), session-start auto-recall. GitHub synced. 119/119 tests."
 ---
 
 # Brain-Inspired Autonomy Roadmap — build next session

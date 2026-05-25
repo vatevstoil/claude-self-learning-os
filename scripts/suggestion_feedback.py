@@ -26,6 +26,8 @@ DEFAULT = LOGS_DIR / "suggestion-feedback.json"
 # Auto-suppress an item after being surfaced this many times without explicit action
 IMPLICIT_SUPPRESS_THRESHOLD = 5
 
+ACCEPTED_HABITS_PATH = LOGS_DIR / "accepted-habits.json"
+
 
 # ---------------------------------------------------------------------------
 # Persistence helpers
@@ -126,16 +128,53 @@ def dismiss(
     return entry
 
 
+def _queue_accepted_habit(item_id: str, path: Path = ACCEPTED_HABITS_PATH) -> None:
+    """Append item_id to the accepted-habits queue (deduplicates).
+
+    Args:
+        item_id: Unique identifier of the habit item to queue.
+        path: Path to the accepted-habits JSON file.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing: list[str] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    except Exception:
+        existing = []
+    if item_id not in existing:
+        existing.append(item_id)
+        # Atomic write
+        import tempfile
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(existing, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def accept(
     item_id: str,
+    item_type: str | None = None,
     path: Path = DEFAULT,
+    accepted_habits_path: Path = ACCEPTED_HABITS_PATH,
     now: datetime | None = None,
 ) -> dict:
     """Record acceptance of *item_id*, clearing any suppression.
 
+    When item_type == "habit", also queues the item for skill scaffolding
+    by appending item_id to accepted-habits.json.
+
     Args:
         item_id: Unique identifier of the suggestion item.
+        item_type: Optional type string (e.g. "habit", "boris_rule"). When
+            "habit", triggers queuing for skill scaffold generation.
         path: Path to the feedback JSON file.
+        accepted_habits_path: Path to the accepted-habits queue file.
         now: Current timestamp (UTC). Defaults to datetime.now(timezone.utc).
 
     Returns:
@@ -146,15 +185,19 @@ def accept(
 
     data = load_feedback(path)
     entry = data.get(item_id, {})
-
     entry.update(
         status="accepted",
         last_at=now.isoformat(),
         suppress_until=None,
+        item_type=item_type,
     )
-    # Preserve dismiss_count if present (history is useful)
     data[item_id] = entry
     save_feedback(data, path)
+
+    # Queue habit items for skill scaffold generation
+    if item_type == "habit":
+        _queue_accepted_habit(item_id, accepted_habits_path)
+
     return entry
 
 
@@ -280,6 +323,8 @@ def main() -> None:
 
     a_parser = sub.add_parser("accept", help="Accept a suggestion item")
     a_parser.add_argument("id", help="Item ID to accept")
+    a_parser.add_argument("--type", default=None, dest="item_type",
+                          help="Item type (habit, boris_rule, etc.) — triggers side effects")
 
     sub.add_parser("list", help="List all feedback entries")
 
@@ -291,7 +336,7 @@ def main() -> None:
               f"(dismiss #{entry['dismiss_count']})")
 
     elif args.cmd == "accept":
-        entry = accept(args.id)
+        entry = accept(args.id, item_type=args.item_type)
         print(f"Accepted '{args.id}' — suppression cleared (last_at {entry['last_at']})")
 
     elif args.cmd == "list":
