@@ -7,14 +7,19 @@ directly -- produces drafts only. Human approves before any rule lands.
 Usage:
     python boris_draft.py
     python boris_draft.py --min-count 4
+    python boris_draft.py --process-accepted
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
+from datetime import date
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -280,6 +285,151 @@ def write_drafts(
     return written
 
 
+_DEFAULT_ACCEPTED_BORIS = Path.home() / ".claude" / "logs" / "accepted-boris.json"
+
+
+def _extract_proposed_rule(draft_text: str) -> str | None:
+    """Extract rule text from the first fenced code block after '## Proposed Rule'.
+
+    Args:
+        draft_text: Full markdown content of a boris draft file.
+
+    Returns:
+        The stripped rule string, or None if the block cannot be found.
+    """
+    # Find the ## Proposed Rule section first
+    section_match = re.search(r"^## Proposed Rule\s*$", draft_text, re.MULTILINE)
+    if not section_match:
+        return None
+
+    # Search for the first fenced code block (``` ... ```) after that position
+    after = draft_text[section_match.end():]
+    block_match = re.search(r"```[^\n]*\n(.*?)```", after, re.DOTALL)
+    if not block_match:
+        return None
+
+    return block_match.group(1).strip()
+
+
+def process_accepted_boris(
+    accepted_path: Path = _DEFAULT_ACCEPTED_BORIS,
+    drafts_dir: Path = _DEFAULT_OUT_DIR,
+) -> list[str]:
+    """Apply accepted boris rules to their target CLAUDE.md files.
+
+    For each item_id in accepted-boris.json:
+    1. Strip "boris_rule-" prefix to get project_key.
+    2. Find draft file: drafts_dir / _safe_filename(project_key).md
+    3. Extract rule text from the "## Proposed Rule" code block.
+    4. Decode CLAUDE.md path using _encode_to_path_hint(project_key).
+    5. If CLAUDE.md exists: backup it, then append rule under ## Learned Rules.
+    6. If CLAUDE.md missing: create it with the rule.
+    7. After processing all: write [] to accepted_path (clear queue).
+
+    Args:
+        accepted_path: Path to accepted-boris.json queue file.
+        drafts_dir: Directory containing boris draft .md files.
+
+    Returns:
+        List of item_ids successfully applied.  Never raises — logs errors and
+        continues on per-item failures.
+    """
+    # Load the queue
+    try:
+        raw = accepted_path.read_text(encoding="utf-8")
+        queue: list[str] = json.loads(raw)
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        log.error("process_accepted_boris: failed to read queue %s: %s", accepted_path, exc)
+        return []
+
+    if not isinstance(queue, list) or not queue:
+        return []
+
+    applied: list[str] = []
+
+    for item_id in queue:
+        try:
+            # Strip "boris_rule-" prefix to get the project key
+            if item_id.startswith("boris_rule-"):
+                project_key = item_id[len("boris_rule-"):]
+            else:
+                project_key = item_id
+
+            # Locate draft file
+            draft_file = drafts_dir / (_safe_filename(project_key) + ".md")
+            if not draft_file.exists():
+                log.warning("process_accepted_boris: draft not found for %s at %s", item_id, draft_file)
+                continue
+
+            draft_text = draft_file.read_text(encoding="utf-8")
+            rule_text = _extract_proposed_rule(draft_text)
+            if not rule_text:
+                log.warning("process_accepted_boris: could not extract rule from %s", draft_file)
+                continue
+
+            # Resolve CLAUDE.md path via path hint
+            path_hint = _encode_to_path_hint(project_key)
+            claude_md = Path(path_hint) / "CLAUDE.md"
+
+            today = date.today().isoformat()
+
+            if claude_md.exists():
+                # Backup before modifying
+                backup_path = Path(str(claude_md) + f".boris-backup-{today}")
+                backup_path.write_bytes(claude_md.read_bytes())
+
+                content = claude_md.read_text(encoding="utf-8")
+
+                # Find ## Learned Rules section and append after its last line
+                section_match = re.search(
+                    r"(^## Learned Rules\s*\n)(.*?)(?=\n## |\Z)",
+                    content,
+                    re.MULTILINE | re.DOTALL,
+                )
+                if section_match:
+                    # Append the rule line at the end of the section block
+                    insert_pos = section_match.end()
+                    rule_line = f"- {rule_text}\n"
+                    content = content[:insert_pos] + rule_line + content[insert_pos:]
+                else:
+                    # No ## Learned Rules section — append one at end of file
+                    if not content.endswith("\n"):
+                        content += "\n"
+                    content += f"\n## Learned Rules\n- {rule_text}\n"
+
+                claude_md.write_text(content, encoding="utf-8")
+            else:
+                # Create a minimal CLAUDE.md with the rule
+                claude_md.parent.mkdir(parents=True, exist_ok=True)
+                claude_md.write_text(
+                    f"# Project Rules\n\n## Learned Rules\n- {rule_text}\n",
+                    encoding="utf-8",
+                )
+
+            applied.append(item_id)
+            log.info("process_accepted_boris: applied '%s' -> %s", rule_text[:60], claude_md)
+
+        except Exception as exc:
+            log.error("process_accepted_boris: error processing %s: %s", item_id, exc)
+            continue
+
+    # Clear the queue regardless of partial failures
+    try:
+        import os
+        import tempfile
+        accepted_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(accepted_path.parent), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump([], fh)
+        os.replace(tmp, str(accepted_path))
+    except Exception as exc:
+        log.error("process_accepted_boris: failed to clear queue: %s", exc)
+
+    return applied
+
+
 def main() -> None:
     """Entry point: read default candidates, write drafts, report to stderr."""
     import argparse
@@ -305,7 +455,19 @@ def main() -> None:
         default=_DEFAULT_OUT_DIR,
         help=f"Directory for draft files (default: {_DEFAULT_OUT_DIR}).",
     )
+    parser.add_argument(
+        "--process-accepted",
+        action="store_true",
+        help="Apply accepted boris rules from accepted-boris.json to CLAUDE.md files.",
+    )
     args = parser.parse_args()
+
+    if args.process_accepted:
+        applied = process_accepted_boris(drafts_dir=args.output_dir)
+        print(f"Boris rules applied: {len(applied)}", file=sys.stderr)
+        for item_id in applied:
+            print(f"  {item_id}", file=sys.stderr)
+        return
 
     written = write_drafts(
         boris_path=args.input,
