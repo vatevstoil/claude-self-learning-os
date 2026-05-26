@@ -10,6 +10,7 @@ Token-conscious: typically 0-30 tokens output.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -223,6 +224,15 @@ def main() -> None:
                     break
         except Exception:
             pass
+
+    # --- Rotating token hygiene tip (1 per session, cycles daily) ---
+    _TIPS = [
+        "💡 ≤2 файла, ясна задача → директно без агенти",
+        "💡 15-20 msg по темата → /clear",
+        "💡 Голям файл → python -c summary, не чети директно",
+        "💡 Batch свързани въпроси в 1 prompt → -40% turns",
+    ]
+    alerts.append(_TIPS[datetime.date.today().toordinal() % len(_TIPS)])
 
     if alerts:
         print("\n".join(alerts))

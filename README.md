@@ -65,10 +65,11 @@ The system runs entirely as scheduled Python scripts (Windows Task Scheduler or 
 **Layer 1 — Knowledge & Self-Regulation**
 
 - **4-layer memory** — Pinecone (cross-session recall) → Obsidian wikis → Graphify knowledge graphs → CLAUDE.md session windows
-- **Autonomous pipeline** — 36 scripts, scheduled daily/weekly/dreaming; pure Python, 0 LLM tokens in the automation loop
+- **Autonomous pipeline** — 37 scripts, scheduled daily/weekly/dreaming; pure Python, 0 LLM tokens in the automation loop
 - **Self-regulation immune system** — `selfreg_monitor` grades itself across 7 dimensions (cron health, run errors, freshness, lint, hygiene, dispatcher, queue), tracks grade trends, flags regressions before they degrade quality
 - **Boris loop** — detects repeated corrections per project, surfaces rule candidates, auto-patches CLAUDE.md with backup on accept
-- **SessionStart hook** — surfaces top 2 ranked suggestions + anticipation prediction at session open (0–40 tokens, never bloats context)
+- **SessionStart hook** — surfaces top 2 ranked suggestions + anticipation prediction + rotating token hygiene tip at session open (0–40 tokens, never bloats context)
+- **Wiki stop reminder** — `wiki_stop_reminder` blocks session exit if the current project's wiki is stale (>4 days), prompts update, rate-limited to once per project per day
 - **Incremental knowledge sync** — content-hash manifest ensures only changed content is re-embedded; never bulk-syncs raw transcripts
 
 **Layer 2 — Brain-Inspired Self-Learning OS**
@@ -181,8 +182,9 @@ daily (09:00)
   selfreg_monitor            → logs/selfreg-health.json (grade A–F)
 
   hooks (per session, not scheduled):
+  wiki_stop_reminder [Stop]  → block exit if project wiki stale (once/day/project)
   auto_pinecone_save [Stop]  → save session learnings to Pinecone
-  session_start_brief [SessionStart] → surface top-2 suggestions + 🔮 anticipation
+  session_start_brief [SessionStart] → surface top-2 suggestions + 🔮 anticipation + daily token tip
 
 weekly (Sunday 10:00)
   learning_promoter          → promote patterns to Pinecone
