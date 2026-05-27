@@ -79,18 +79,65 @@ def ascii_slug(s: str) -> str:
     return s or "unnamed"
 
 
+def _check_duplicates(namespace: str, text: str, threshold: float = 0.88) -> list[dict]:
+    """Query Pinecone for semantically similar existing entries.
+
+    Args:
+        namespace: target namespace
+        text: candidate text to promote
+        threshold: score above which to consider it a near-duplicate
+
+    Returns list of {id, score, preview} dicts for matches above threshold.
+    Returns [] if Pinecone unavailable — never blocks promotion on network errors.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import pinecone as _pc
+        matches = _pc.query_and_track(namespace, text, topk=3)
+        return [
+            {
+                "id": m.get("id", "?"),
+                "score": m.get("score", 0.0),
+                "preview": ((m.get("metadata") or {}).get("text", ""))[:120],
+            }
+            for m in (matches or [])
+            if m.get("score", 0.0) >= threshold
+        ]
+    except Exception:
+        return []
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("namespace")
     p.add_argument("text")
     p.add_argument("--source", default="manual",
                    help="Where this pattern came from (e.g., 'cinemind/auth.md')")
+    p.add_argument("--force", action="store_true",
+                   help="Skip pre-promote semantic duplicate check")
     args = p.parse_args()
 
     if not args.text.strip():
         sys.exit("ERROR: text is empty")
 
     safe_ns = ascii_slug(args.namespace)
+
+    # Pre-promote semantic check: refuse if near-duplicate exists. Prevents
+    # accumulation of redundant patterns and forces explicit override via --force.
+    # Skipped silently when Pinecone is unavailable (e.g. offline run).
+    if not args.force:
+        dupes = _check_duplicates(safe_ns, args.text, threshold=0.88)
+        if dupes:
+            print(f"⚠ Found {len(dupes)} similar existing entry/ies in '{safe_ns}':")
+            for d in dupes:
+                print(f"  [{d['score']:.3f}] {d['id']}")
+                print(f"     {d['preview']}")
+            print()
+            print("Refusing to promote — duplicate-looking pattern. Options:")
+            print("  - Adjust text to add new insight, or")
+            print("  - Re-run with --force to promote anyway.")
+            sys.exit(2)
+
     content_hash = hashlib.sha256(args.text.encode("utf-8")).hexdigest()[:12]
     entry_id = f"{safe_ns}-promoted-{content_hash}"
 

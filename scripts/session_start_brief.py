@@ -212,18 +212,90 @@ def main() -> None:
             pass
 
     # --- Anticipation: surface the top predicted routine for THIS project (proactive) ---
+    # Matching is order-sensitive: substring match against ~30 boris-encoded keys
+    # previously hit the wrong project (e.g. "Claude" matched
+    # "...Facturka-bg--claude-worktrees-bold-kilby-..." first). Three-tier match:
+    #   1. Exact encoded key (drive + path → "J--Antigraviti-Claude")
+    #   2. Segment match: project name must appear as own '-'-bounded segment,
+    #      AND the key must NOT be a worktree (skip "--claude-worktrees-...")
+    #   3. Fall back to most-recent-data when ambiguous
     if project:
         try:
             ant = json.loads((LOGS / "anticipations.json").read_text(encoding="utf-8"))
-            pnorm = _norm(project)
-            for proj_key, preds in (ant or {}).items():
-                if pnorm and (pnorm in _norm(proj_key) or _norm(proj_key) in pnorm) and preds:
-                    routine = preds[0].get("routine") or []
-                    if routine:
-                        alerts.append(f"🔮 В {project} обикновено: {' → '.join(routine)}")
-                    break
+            cwd_clean = cwd.replace("\\", "/").rstrip("/")
+            # Construct expected key: "{{CODE_PATH}}/Claude" → "J--Antigraviti-Claude"
+            expected_key = None
+            m = re.match(r"^([A-Za-z]):/(.+)$", cwd_clean)
+            if m:
+                drive, rest = m.group(1).upper(), m.group(2)
+                expected_key = f"{drive}--" + rest.replace("/", "-").replace(" ", "-")
+
+            picked = None
+            # Tier 1: exact (case-insensitive) — most reliable
+            if expected_key:
+                for k in (ant or {}).keys():
+                    if k.lower() == expected_key.lower() and ant[k]:
+                        picked = (k, ant[k])
+                        break
+
+            # Tier 2: segment match excluding worktrees
+            if not picked:
+                pnorm = _norm(project)
+                for k, preds in (ant or {}).items():
+                    if "claude-worktrees" in k.lower():
+                        continue  # skip auto-generated worktree branches
+                    # Project must appear as its own segment (between -- or at start/end)
+                    segments = [_norm(s) for s in re.split(r"-+", k) if s]
+                    if pnorm and pnorm in segments and preds:
+                        picked = (k, preds)
+                        break
+
+            if picked:
+                _, preds = picked
+                routine = (preds[0] or {}).get("routine") or []
+                if routine:
+                    alerts.append(f"🔮 В {project} обикновено: {' → '.join(routine)}")
         except Exception:
             pass
+
+    # --- Session-size alarm (proactive: detect long-running session at resume) ---
+    # Claude Code stores each session as a single .jsonl file under
+    # ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl. File size correlates
+    # roughly with context buildup. Warns at SessionStart resume so the user
+    # sees it BEFORE doing more work in an already-bloated session.
+    try:
+        session_id = payload.get("session_id") or payload.get("sessionId")
+        source = (payload.get("source") or "").lower()
+        # Encode cwd to Claude's project dir format: {{CODE_PATH}}\Claude → J--Antigraviti-Claude
+        cwd_norm = cwd.replace("\\", "/").rstrip("/")
+        m = re.match(r"^([A-Za-z]):/(.+)$", cwd_norm)
+        if m and session_id:
+            drive, rest = m.group(1).upper(), m.group(2)
+            encoded = f"{drive}--" + rest.replace("/", "-").replace(" ", "-")
+            proj_dir = Path.home() / ".claude" / "projects" / encoded
+            sess_file = proj_dir / f"{session_id}.jsonl"
+            # Fallback: try case-insensitive (Windows) — find any matching dir
+            if not sess_file.exists():
+                parent = proj_dir.parent
+                if parent.exists():
+                    for d in parent.iterdir():
+                        if d.is_dir() and d.name.lower() == encoded.lower():
+                            sess_file = d / f"{session_id}.jsonl"
+                            break
+            if sess_file.exists() and source in ("resume", "compact"):
+                size_kb = sess_file.stat().st_size / 1024
+                if size_kb >= 1500:
+                    alerts.append(
+                        f"🚨 Session resumed at {size_kb/1024:.1f}MB transcript "
+                        f"— /clear силно препоръчан преди да продължиш"
+                    )
+                elif size_kb >= 700:
+                    alerts.append(
+                        f"⚠ Session resumed at {size_kb:.0f}KB transcript "
+                        f"— обмисли /clear при смяна на тема"
+                    )
+    except Exception:
+        pass
 
     # --- Rotating token hygiene tip (1 per session, cycles daily) ---
     _TIPS = [

@@ -177,6 +177,9 @@ def daily_tasks():
     results["habit_miner"] = run_safe(SCRIPTS_DIR / "habit_miner.py", ["--days", "2"], timeout=180)
     results["habit_accept_queue"] = run_safe(SCRIPTS_DIR / "habit_to_skill.py", ["--process-accepted"], timeout=60)
     results["boris_apply"] = run_safe(SCRIPTS_DIR / "boris_draft.py", ["--process-accepted"], timeout=60)
+    # anticipate must run daily — previously only in weekly dreaming, so the
+    # SessionStart hook's 🔮 prediction was up to 6 days stale by mid-week.
+    results["anticipate"] = run_safe(SCRIPTS_DIR / "anticipate.py", [], timeout=60)
     results["selfreg_monitor"] = run_safe(SCRIPTS_DIR / "selfreg_monitor.py", [])
     write_health("daily", results)
     log.info("=== DAILY RUN END ===")
