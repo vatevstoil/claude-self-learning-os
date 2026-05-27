@@ -142,6 +142,45 @@ def _encode_to_path_hint(project_key: str) -> str:
     return drive + ":\\" + "\\".join(expanded)
 
 
+def _resolve_real_project_dir(decoded_path: str) -> Path | None:
+    """Resolve the *actual* project directory from a lossy path hint.
+
+    The Boris encoding collapses space/dot/dash all to single dash, so a
+    decoded path like ``J:\\Antigraviti\\StroyOffice-Pro`` may correspond to
+    the real folder ``StroyOffice Pro`` or ``StroyOffice.Pro``. Writing to
+    the decoded path verbatim would create a *new* wrong-name folder and
+    silently bypass the real project's CLAUDE.md.
+
+    Strategy:
+    1. If the decoded path exists as-is → return it (no ambiguity).
+    2. Otherwise scan the parent for siblings whose normalized name (all
+       of ``- . _ <space>`` → ``-``) equals the candidate's normalized form.
+    3. Exactly one match → return it. Zero or multiple → return None
+       (caller must refuse to write to avoid corrupting the wrong project).
+
+    Returns None when resolution is ambiguous; caller MUST NOT fall back to
+    creating a new folder at the lossy path.
+    """
+    p = Path(decoded_path)
+    if p.exists():
+        return p
+
+    parent = p.parent
+    if not parent.exists():
+        # Parent dir itself unknown — cannot fuzzy match. Bail out.
+        return None
+
+    def _norm(name: str) -> str:
+        return re.sub(r"[-._ ]+", "-", name).lower()
+
+    target = _norm(p.name)
+    candidates = [d for d in parent.iterdir() if d.is_dir() and _norm(d.name) == target]
+    if len(candidates) == 1:
+        return candidates[0]
+    # 0 matches → project truly doesn't exist; multiple → genuinely ambiguous.
+    return None
+
+
 def _safe_filename(project_key: str) -> str:
     """Return a filesystem-safe filename stem from a project key.
 
@@ -369,9 +408,23 @@ def process_accepted_boris(
                 log.warning("process_accepted_boris: could not extract rule from %s", draft_file)
                 continue
 
-            # Resolve CLAUDE.md path via path hint
+            # Resolve CLAUDE.md path via path hint — fuzzy match against real
+            # directories to handle space/dot/dash ambiguity in the encoding.
             path_hint = _encode_to_path_hint(project_key)
-            claude_md = Path(path_hint) / "CLAUDE.md"
+            real_dir = _resolve_real_project_dir(path_hint)
+            if real_dir is None:
+                # Refuse to write: would either create a wrong-name folder
+                # (e.g. "StroyOffice-Pro" instead of "StroyOffice Pro") or
+                # patch the wrong project's CLAUDE.md. Better to skip and
+                # leave the draft for manual review.
+                log.warning(
+                    "process_accepted_boris: cannot resolve real directory for "
+                    "project_key=%s (decoded hint=%s). Skipping — apply the "
+                    "rule manually from %s",
+                    project_key, path_hint, draft_file,
+                )
+                continue
+            claude_md = real_dir / "CLAUDE.md"
 
             today = date.today().isoformat()
 

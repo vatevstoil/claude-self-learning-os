@@ -18,6 +18,25 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+# Force UTF-8 stdout — Windows default cp1251 cannot encode Cyrillic/emojis
+# in cmd_query/cmd_list output. Importers (hooks, dispatcher) silently swallow
+# UnicodeEncodeError → blind spot; CLI users see crashes mid-response.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+
+class PineconeError(Exception):
+    """Raised by _req() on any network/API failure.
+
+    Critical: must inherit from Exception (not BaseException). Previously
+    _req() called sys.exit() which raises SystemExit (BaseException), bypassing
+    `except Exception` in callers like query_and_track() → killed the calling
+    process (hooks, dispatcher) on transient network errors.
+    """
+
+
 # Load .env
 env_path = Path.home() / ".claude" / ".env"
 if env_path.exists():
@@ -41,11 +60,11 @@ def _req(url, body=None, method="GET"):
     try:
         return json.loads(urlopen(r, timeout=30).read())
     except HTTPError as e:
-        sys.exit(f"HTTP {e.code}: {e.read().decode()[:200]}")
+        raise PineconeError(f"HTTP {e.code}: {e.read().decode()[:200]}") from e
     except URLError as e:
-        sys.exit(f"Network error: {e.reason}")
+        raise PineconeError(f"Network error: {e.reason}") from e
     except Exception as e:
-        sys.exit(f"Unexpected error in request: {e}")
+        raise PineconeError(f"Unexpected error in request: {e}") from e
 
 
 def embed(text, is_query=False):
@@ -229,7 +248,12 @@ def main():
             args.namespace = sanitize_ns(args.namespace)
         except Exception:
             pass
-    args.func(args)
+    try:
+        args.func(args)
+    except PineconeError as e:
+        # Only convert to process exit when used as CLI; importers catch
+        # PineconeError directly without losing control of the process.
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,15 @@ def _run(ns: str, globs: list[str], force: bool) -> str:
 
 def main() -> None:
     force = "--force" in sys.argv
+    # Safety net: --force re-embeds all wiki content (potential Pinecone cost spike).
+    # Refuse silently in scheduled automation runs — if a debug --force flag is left
+    # in the cron command by accident, this prevents the weekly run from re-embedding
+    # everything. Manual CLI use (no CLAUDE_AUTOMATION_RUN env) still allows --force.
+    if force and os.environ.get("CLAUDE_AUTOMATION_RUN") == "1":
+        print("knowledge_sync: refusing --force inside scheduled automation run "
+              "(would re-embed all content; remove the flag from the scheduled task "
+              "or run manually).")
+        sys.exit(0)
     try:
         wm = json.loads(WIKI_MAP.read_text(encoding="utf-8"))
     except Exception as e:

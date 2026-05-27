@@ -23,7 +23,8 @@ from pathlib import Path
 # Force UTF-8 in all child processes — scheduled tasks run under pythonw.exe with
 # no PYTHONIOENCODING, so a child printing emoji/Cyrillic to its pipe would crash
 # on the cp1251 default. This guarantees utf-8 regardless of host environment.
-_CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+_CHILD_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1",
+              "CLAUDE_AUTOMATION_RUN": "1"}
 
 SCRIPTS_DIR = Path(__file__).parent
 LOGS_DIR = Path.home() / ".claude" / "logs"
