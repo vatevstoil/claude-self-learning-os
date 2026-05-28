@@ -152,6 +152,17 @@ python scripts/automation_dispatcher.py daily
 
 Check `~/.claude/logs/selfreg_health.json` — should show a grade of A or B.
 
+**Run the test suite** (148 tests, pure Python, no network required):
+
+```bash
+pip install pytest
+pytest tests/ -q
+```
+
+The suite covers the brain-inspired engine (habit mining, Hebbian
+consolidation, attention queue, Boris loop, anticipation) plus the
+importable-safety contract for Pinecone access.
+
 ---
 
 ## Configuration
