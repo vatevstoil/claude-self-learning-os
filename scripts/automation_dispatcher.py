@@ -51,8 +51,22 @@ if not log.handlers:
     log.addHandler(_handler)
 
 
+# Scripts whose non-zero exit is SEMANTIC information, not failure.
+# Must stay in sync with selfreg_monitor.SEMANTIC_NONZERO — kept duplicated
+# (not imported) to avoid coupling the dispatcher to selfreg's module loading.
+# Currently:
+#   - wiki_freshness_check.py: exits 1 when ≥1 wiki is stale (information).
+_SEMANTIC_NONZERO = {"wiki_freshness_check.py"}
+
+
 def run_safe(script_path: Path, args: list[str], timeout: int = 300) -> bool:
-    """Run a python script in a subprocess. Always returns; never raises."""
+    """Run a python script in a subprocess. Always returns; never raises.
+
+    Returns True on success OR on semantic-nonzero exit (e.g. wiki_freshness
+    exiting 1 to signal stale wikis). Without this, health.json marks the
+    daily run DEGRADED every day a wiki is stale — a permanent false-positive
+    that hides real failures.
+    """
     name = script_path.name
     cmd = [sys.executable, str(script_path)] + args
     log.info("Starting: %s args=%s", name, args)
@@ -69,10 +83,10 @@ def run_safe(script_path: Path, args: list[str], timeout: int = 300) -> bool:
         log.info("%s: rc=%d stdout=%dB stderr=%dB",
                  name, result.returncode,
                  len(result.stdout or ""), len(result.stderr or ""))
-        if result.returncode != 0:
+        if result.returncode != 0 and name not in _SEMANTIC_NONZERO:
             log.warning("%s stderr (first 300): %s",
                         name, (result.stderr or "")[:300])
-        return result.returncode == 0
+        return result.returncode == 0 or name in _SEMANTIC_NONZERO
     except subprocess.TimeoutExpired:
         log.warning("%s: TIMEOUT after %ds", name, timeout)
         return False
