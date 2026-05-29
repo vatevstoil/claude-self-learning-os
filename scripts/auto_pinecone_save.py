@@ -209,6 +209,47 @@ MAX_CONTENT_LEN = 2000
 MAX_SAVE_CONTENT = 1500
 
 
+# --- Conversational-noise guard -------------------------------------------
+# The last assistant message is frequently a session wrap-up REPORT to the user
+# (e.g. "Готово. Ето одита…", "✅ Sprint завършен", "Перфектно. …") rather than a
+# distilled, reusable learning. These contain code/paths so they pass the
+# has_substance check, then pollute the knowledge namespace and degrade recall.
+# Reject content whose FIRST non-empty line signals a conversational report.
+_NOISE_OPENERS = (
+    "готово", "перфектно", "идеално", "done", "всичко работи", "всичко готово",
+    "приключи", "завършено", "завърших", "ето ", "сега имам", "имам пълната",
+    "имам достатъчно", "финална истина", "финален", "резюме на",
+)
+# Emoji / markdown-title openers typical of report messages (not knowledge).
+_NOISE_OPENER_PREFIXES = ("✅", "🎉", "🔬", "📖", "# ✅", "# 🔬", "## ✅", "**")
+
+
+def is_conversational_noise(content: str) -> bool:
+    """True if *content* looks like a session-wrap report rather than a learning.
+
+    Heuristic, conservative: only fires on strong opener signals so genuine
+    distilled learnings (which start with the topic, code, or a learning marker)
+    are kept. Prevents the auto-saver from storing chat wrap-ups as knowledge.
+    """
+    if not content:
+        return True
+    # First meaningful line
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if any(low.startswith(op) for op in _NOISE_OPENERS):
+            return True
+        if any(line.startswith(p) for p in _NOISE_OPENER_PREFIXES):
+            return True
+        # Test-count wrap-up openers: "114/114", "20/20 tests", "8/9 …"
+        if re.match(r"^\d+\s*/\s*\d+\b", line):
+            return True
+        return False  # first real line is not a noise opener → keep
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Logging — append-only to file, never stdout
 # ---------------------------------------------------------------------------
@@ -445,6 +486,12 @@ def extract_learnings(transcript_path: str) -> tuple[str, str, str] | None:
             is_learning,
             has_substance,
         )
+        return None
+
+    # Reject conversational wrap-up reports — they pass has_substance (code/paths)
+    # but are not distilled knowledge and pollute recall.
+    if is_conversational_noise(last_assistant):
+        log.info("Skipped: last assistant message is a conversational wrap-up, not a learning")
         return None
 
     # Build compact summary
