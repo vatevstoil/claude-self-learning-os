@@ -17,8 +17,26 @@ _TRANSLIT = {
 }
 
 
+# Canonical aliases — keyed on the POST-sanitize form (spaces already → '-').
+# Prevents namespace re-fragmentation: historical drift created duplicates like
+# Trading/Claude Trading/Claude-Trading that split recall. After a one-time
+# consolidation (knowledge_cleanup.py), this keeps every future save+recall
+# converging on the canonical namespace. Add new aliases here as they appear.
+_ALIASES = {
+    "Claude-Trading": "Trading",
+    "Facturka.bg": "Fakturka.bg",
+    "AI Video": "AI-Video",
+    "Davinci Plugin": "Davinci-Plugin",
+    "CasinoScore-AI": "CasinoScore",
+    "Web-Design": "WebDesign",
+    "Web-Designe": "WebDesign",
+    "Petar-Danov": "PetarDanov",
+    "shared": "_shared",
+}
+
+
 def sanitize_ns(name: str) -> str:
-    """Return an ASCII, Pinecone-safe namespace for any (possibly Cyrillic) name."""
+    """Return an ASCII, Pinecone-safe, canonical namespace for any name."""
     if not name:
         return "default"
     out = []
@@ -32,4 +50,5 @@ def sanitize_ns(name: str) -> str:
     s = "".join(out)
     s = s.encode("ascii", "ignore").decode("ascii")   # drop any remaining non-ASCII
     s = re.sub(r"[^A-Za-z0-9._-]", "-", s).strip("-")  # safe charset; keep leading _ (valid, intentional: _meta/_shared)
-    return s or "default"
+    s = s or "default"
+    return _ALIASES.get(s, s)                          # canonicalize known aliases
