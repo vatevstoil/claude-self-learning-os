@@ -1,0 +1,62 @@
+{
+  "meta": {
+    "project": "PROJECT_NAME",
+    "description": "One-line description of what the project does",
+    "stack": "e.g. FastAPI + SQLAlchemy + React 19 + Vite",
+    "entry_point": "relative path to main entry (e.g. backend/main.py, src/app.js)",
+    "graph_updated": "YYYY-MM-DD",
+    "obsidian_path": "{{WIKI_PATH}}\\PROJECT\\graph\\"
+  },
+
+  "architecture": {
+    "type": "monolith | monorepo | microservices",
+    "backend": "Framework + ORM + DB description",
+    "frontend": "Framework + state + bundler (or 'none')",
+    "databases": ["primary DB", "cache", "vector store", "graph DB"],
+    "external_services": ["Stripe", "SendGrid", "Gemini AI"],
+    "workers": "Celery / BullMQ / none",
+    "auth": "JWT httpOnly cookies | API key | PIN | OAuth"
+  },
+
+  "critical_rules": [
+    "Rule 1 — one sentence, actionable",
+    "Rule 2 — include what NOT to do",
+    "Rule 3 — static routes BEFORE /{id} (if FastAPI/Express)",
+    "Rule 4 — tenant isolation field (owner_id / workspace_id / casino_id)",
+    "Rule 5 — soft delete filter (deleted_at.is_(None) / est_supprime = 0)",
+    "Add 5-15 rules — only non-obvious gotchas, not derivable from reading code"
+  ],
+
+  "clusters": {
+    "cluster_name": {
+      "description": "What this cluster handles",
+      "files": ["path/to/router.py", "path/to/model.py"],
+      "obsidian_page": "[[graph/cluster_name]]"
+    },
+    "auth": {
+      "description": "Authentication, JWT, sessions, OAuth",
+      "files": ["backend/auth.py", "backend/routers/auth_router.py"],
+      "obsidian_page": "[[graph/auth]]"
+    },
+    "invoicing": {
+      "description": "Invoice CRUD, PDF generation, soft delete",
+      "files": ["backend/routers/invoices_router.py", "backend/models.py#Invoice"],
+      "obsidian_page": "[[graph/invoicing]]"
+    }
+  },
+
+  "edges": [
+    {"from": "frontend", "to": "auth", "type": "depends_on", "note": "UI gates on session"},
+    {"from": "invoicing", "to": "auth", "type": "depends_on", "note": "tenant scope from current_user"},
+    {"from": "auth", "to": "core", "type": "part_of", "note": "auth is a core subsystem"}
+  ],
+
+  "common_patterns": {
+    "tenant_filter": "Model.owner_id == current_user.id (+ deleted_at.is_(None))",
+    "error_response": "HTTPException(404) for missing/unauthorized resources",
+    "money_column": "Numeric(12, 2, asdecimal=False)",
+    "datetime": "datetime.now(timezone.utc) — NOT datetime.utcnow()"
+  },
+
+  "_edge_types": "Typed cluster relationships (Infinite Brain schema — lets AI decide go-deeper/skip without reading files). Use: depends_on (A needs B) · part_of (hierarchy) · preceded_by / followed_by (pipeline order) · derived_from (generated/built on) · supports · contradicts · related_to (generic) · authored. Omit the 'edges' array for trivial projects."
+}

@@ -1,0 +1,89 @@
+"""Tests for daily_brief.py pure functions (open-note capture, priorities, render)."""
+import importlib
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+db = importlib.import_module("daily_brief")
+
+
+# ── open-note extraction ─────────────────────────────────────────────────────
+
+def test_extract_real_notes():
+    text = "blah {напомни ми за X} more {check the deploy} end"
+    assert db.extract_open_notes(text) == ["напомни ми за X", "check the deploy"]
+
+
+def test_extract_skips_empty_placeholders():
+    assert db.extract_open_notes("{ }") == []
+    assert db.extract_open_notes("{}") == []
+    assert db.extract_open_notes("{…}") == []
+    assert db.extract_open_notes("{...}") == []
+    assert db.extract_open_notes("{ · }") == []
+
+
+def test_extract_mixed():
+    assert db.extract_open_notes("{ } {real one} {.}") == ["real one"]
+
+
+def test_extract_ignores_braces_inside_html_comments():
+    # The brief template puts example braces in a comment — must NOT be captured.
+    text = "<!-- напр. {напомни ми за X}, игнорирай -->\n{реална бележка}\n{ }"
+    assert db.extract_open_notes(text) == ["реална бележка"]
+
+
+def test_build_brief_open_notes_header_has_no_capturable_braces():
+    # Regression: the open-notes header/comment must not contain {...} that the
+    # extractor would later mistake for a real note (caused phantom carried notes).
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [])
+    seg = md.split("## 📝 Open notes", 1)[1]
+    assert db.extract_open_notes(seg) == []  # a fresh brief has zero real notes
+
+
+# ── priorities ───────────────────────────────────────────────────────────────
+
+def test_priorities_includes_queue_and_stale():
+    out = db.top_priorities(queue=[], stale=[{"project": "StroyOffice"}], queue_depth=2)
+    assert any("replay-queue" in p for p in out)
+    assert any("StroyOffice" in p for p in out)
+
+
+def test_priorities_sorted_by_score_and_capped():
+    queue = [
+        {"id": "a", "type": "boris_rule", "project": "X", "score": "0.3"},
+        {"id": "b", "type": "boris_rule", "project": "Y", "score": "0.9"},
+    ]
+    out = db.top_priorities(queue=queue, stale=[], queue_depth=0, k=3)
+    assert len(out) <= 3
+    # higher score (Y) appears before lower (X)
+    joined = " | ".join(out)
+    assert joined.index("Y") < joined.index("X")
+
+
+def test_priorities_empty_state_is_empty():
+    assert db.top_priorities(queue=[], stale=[], queue_depth=0) == []
+
+
+# ── render ───────────────────────────────────────────────────────────────────
+
+def test_build_brief_has_core_sections():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], ["⚡ do thing"],
+                        {}, 0, [])
+    assert "# Daily Brief — 2026-06-05" in md
+    assert "## 🎯 Днес" in md
+    assert "## 📊 Система" in md
+    assert "## 📝 Open notes" in md
+    assert "{ }" in md  # the writable placeholder
+    assert "A** (92/100)" in md or "A (92/100)" in md
+
+
+def test_build_brief_renders_carried_notes():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0,
+                        ["напомни за релийза"])
+    assert "Хванати бележки" in md
+    assert "напомни за релийза" in md

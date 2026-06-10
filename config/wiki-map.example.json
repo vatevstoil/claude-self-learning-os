@@ -1,0 +1,11 @@
+{
+  "description": "Maps code-project folders to wiki folders. Drives freshness, knowledge_sync, registry.",
+  "base_code_path": "{{CODE_PATH}}",
+  "base_wiki_path": "{{WIKI_PATH}}",
+  "mapping": {
+    "MyProject": "MyProject"
+  },
+  "metadata": {
+    "MyProject": {"status": "active", "stack": "describe-your-stack"}
+  }
+}
