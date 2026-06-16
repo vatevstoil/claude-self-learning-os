@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from core_io import load_json_tolerant, atomic_write_json
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -92,17 +94,10 @@ def load_ledger(path: Path = LEDGER_PATH) -> dict:
     Returns:
         Ledger dict mapping routine key -> entry dict.
     """
-    path = Path(path)
-    if not path.exists():
+    data = load_json_tolerant(path, {})
+    if not isinstance(data, dict):
         return {}
-    try:
-        text = path.read_text(encoding="utf-8")
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            return {}
-        return data
-    except Exception:
-        return {}
+    return data
 
 
 def save_ledger(ledger: dict, path: Path = LEDGER_PATH) -> None:
@@ -115,26 +110,52 @@ def save_ledger(ledger: dict, path: Path = LEDGER_PATH) -> None:
         ledger: Ledger dict to serialize.
         path: Destination file path (parent directories created if absent).
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(path, ledger)
 
-    payload = json.dumps(ledger, ensure_ascii=False, indent=2)
 
-    # Write to a temp file in the same directory for atomic rename
-    fd, tmp_path_str = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".habit-ledger-", suffix=".tmp"
-    )
+def mark_pruned(keys: list[str], path: Path = LEDGER_PATH) -> int:
+    """Set status='pruned' on the given ledger keys.
+
+    Called by llm_judge._prune_drafts() after moving junk draft dirs so the
+    ledger reflects the pruned state and write_skill_drafts() can skip
+    re-generating them on the next dreaming cycle.
+
+    If a key is not present in the ledger (slug-to-key mapping is imprecise),
+    it is silently skipped rather than raising — best-effort, never breaks.
+
+    Args:
+        keys: Ledger key strings to mark as pruned.
+        path: Path to habit-ledger.json; defaults to the canonical location.
+
+    Returns:
+        Number of ledger entries actually updated.
+    """
+    if not keys:
+        return 0
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-        os.replace(tmp_path_str, str(path))
-    except Exception:
-        # Clean up temp file on failure; re-raise so caller knows
+        ledger = load_ledger(path)
+    except Exception as exc:
+        import sys as _sys
+        print(f"[habit_ledger] mark_pruned: could not load ledger: {exc}", file=_sys.stderr)
+        return 0
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    count = 0
+    for key in keys:
+        if key in ledger and isinstance(ledger[key], dict):
+            ledger[key]["status"] = "pruned"
+            ledger[key]["pruned_at"] = now_iso
+            count += 1
+
+    if count:
         try:
-            os.unlink(tmp_path_str)
-        except OSError:
-            pass
-        raise
+            save_ledger(ledger, path)
+        except Exception as exc:
+            import sys as _sys
+            print(f"[habit_ledger] mark_pruned: could not save ledger: {exc}", file=_sys.stderr)
+            return 0
+
+    return count
 
 
 # ---------------------------------------------------------------------------

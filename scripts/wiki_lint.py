@@ -39,11 +39,21 @@ def _exists_rec(base: Path, names: list[str]) -> bool:
 
 
 def _has_frontmatter(base: Path, names: list[str]) -> bool:
+    """Return True if ANY of the nav-hub candidates has valid YAML frontmatter.
+
+    Bug fixed: the old implementation returned False immediately on the first
+    readable file that lacked frontmatter (e.g. index.md), without checking
+    the remaining candidates (e.g. overview.md which *does* have frontmatter).
+    Now we check every existing candidate and return True as soon as one passes.
+    """
     for n in names:
         for p in (base / n, base / "wiki" / n):
             if p.exists():
                 try:
-                    return p.read_text(encoding="utf-8", errors="replace").lstrip().startswith("---")
+                    if p.read_text(encoding="utf-8", errors="replace").lstrip().startswith("---"):
+                        return True
+                    # File exists but has no frontmatter — keep looking at
+                    # the remaining candidates instead of returning False here.
                 except OSError:
                     pass
     return False

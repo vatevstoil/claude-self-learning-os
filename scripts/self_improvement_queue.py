@@ -18,10 +18,55 @@ import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+# Shared filters: keep pure tool-ngram routines (Edit>Bash:grep noise) out of
+# the queue entirely so the judge budget is spent on real candidates.
+try:  # pragma: no cover - siblings are always present in practice
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from llm_judge import is_tool_ngram as _is_tool_ngram
+    from habit_to_skill import slugify_routine as _slugify_routine
+except Exception:  # pragma: no cover
+    _is_tool_ngram = None
+    _slugify_routine = None
+
 LOGS_DIR = Path.home() / ".claude" / "logs"
 DEFAULT_OUT = LOGS_DIR / "improvement-queue.json"
 # Boris items with count >= 6 score 0.855; threshold 0.85 makes auto_apply reachable
 AUTO_APPLY_THRESHOLD = 0.85
+
+# Default paths for trust_tiers dependency injection (patchable in tests)
+_TRUST_EFFECTIVENESS_PATH = LOGS_DIR / "effectiveness.json"
+_TRUST_OVERRIDES_PATH = Path.home() / ".claude" / "trust-overrides.json"
+
+
+def _get_trust_tier(
+    item_type: str,
+    effectiveness_path: Path | None = None,
+    overrides_path: Path | None = None,
+) -> int:
+    """Return trust tier for *item_type* via trust_tiers.get_tier, fail-closed to 0.
+
+    Lazily imports trust_tiers so the rest of the module works even if the
+    file is temporarily absent.  Any import or runtime error returns 0
+    (fail-closed: do NOT auto_apply).
+
+    Args:
+        item_type: The queue item type string.
+        effectiveness_path: Path override for tests; None uses module default.
+        overrides_path: Path override for tests; None uses module default.
+
+    Returns:
+        Integer tier 0, 1, or 2.  Returns 0 on any failure.
+    """
+    eff_path = effectiveness_path if effectiveness_path is not None else _TRUST_EFFECTIVENESS_PATH
+    ov_path = overrides_path if overrides_path is not None else _TRUST_OVERRIDES_PATH
+    try:
+        import importlib
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        trust_tiers = importlib.import_module("trust_tiers")
+        return trust_tiers.get_tier(item_type, effectiveness_path=eff_path, overrides_path=ov_path)
+    except Exception:
+        return 0  # fail-closed
 
 # Patchable in tests so suppression filter reads a tmp feedback file
 _FEEDBACK_PATH = LOGS_DIR / "suggestion-feedback.json"
@@ -56,7 +101,8 @@ class QueueItem:
     source: str = ""
     judge_score: float | None = None   # LLM quality score 0.0-1.0, None = unscored
     judge_reason: str = ""             # One-sentence LLM explanation
-    judge_verdict: str = ""            # "useful" | "junk" | "" (empty = unscored)
+    judge_verdict: str = ""            # "useful" | "junk" | "error" | "" (empty = unscored)
+    judge_fail_count: int = 0          # consecutive failures; >= 2 → permanently skipped
 
 
 _VALUE = {
@@ -101,6 +147,7 @@ def _load_boris(path: Path) -> list[QueueItem]:
             score=round(confidence * value, 3),
             source=str(path),
         )
+        # Status will be tier-gated in build_queue; set provisional here.
         item.status = "auto_apply" if item.score >= AUTO_APPLY_THRESHOLD else "queued"
         items.append(item)
     return items
@@ -130,6 +177,14 @@ def _load_habits(path: Path, ledger_path: Path | None = None) -> list[QueueItem]
         reward = float(h.get("reward_ratio", 1.0))
         routine = h.get("routine") or []
         proj = h.get("project", "all")
+
+        # Drop pure tool-ngram routines before they crowd the queue and consume
+        # the LLM-judge budget — they have no reusable semantic value.
+        if _is_tool_ngram is not None and _slugify_routine is not None:
+            ngram_slug = _slugify_routine(proj, routine)
+            if ngram_slug and _is_tool_ngram(ngram_slug):
+                continue
+
         key = f"{proj}|{'>'.join(str(t) for t in routine)}"
         status = (ledger.get(key) or {}).get("status", "detected")
 
@@ -160,6 +215,7 @@ def _load_habits(path: Path, ledger_path: Path | None = None) -> list[QueueItem]
             score=round(confidence * value, 3),
             source=str(path),
         )
+        # Status will be tier-gated in build_queue; set provisional here.
         item.status = "auto_apply" if item.score >= AUTO_APPLY_THRESHOLD else "queued"
         items.append(item)
     return items
@@ -189,15 +245,42 @@ def _load_graphify(path: Path) -> list[QueueItem]:
 
 
 def _load_promotions(path: Path) -> list[QueueItem]:
+    """Parse pending promotions written by learning_promoter.py.
+
+    learning_promoter writes two complementary markers per candidate:
+      - Section heading:  ``## Candidate N: <title>``
+      - Status checkbox:  ``- [ ] Candidate N``   (no title, just the number)
+
+    We parse the section headings to extract titles and skip any candidate
+    whose checkbox has been ticked (``- [x]``) — meaning it was already applied.
+
+    Args:
+        path: Path to promotions-pending.md.
+
+    Returns:
+        List of QueueItem for each pending (un-ticked) promotion candidate.
+    """
     if not path.exists():
         return []
     try:
         text = path.read_text(encoding="utf-8")
     except Exception:
         return []
+
+    # Build set of already-applied candidate numbers (checked boxes).
+    # Format: ``- [x] Candidate N``
+    applied_nums: set[int] = {
+        int(m.group(1))
+        for m in re.finditer(r"- \[x\] Candidate (\d+)", text, re.IGNORECASE)
+    }
+
     items = []
-    for m in re.finditer(r"- \[ \] Candidate \d+: (.+?)(?:\n|$)", text):
-        desc = m.group(1).strip()[:200]
+    # Section heading format: ``## Candidate N: <title>``
+    for m in re.finditer(r"^## Candidate (\d+): (.+?)$", text, re.MULTILINE):
+        num = int(m.group(1))
+        if num in applied_nums:
+            continue  # already applied — skip
+        desc = m.group(2).strip()[:200]
         confidence = 0.75
         value = _VALUE["promotion"]
         item = QueueItem(
@@ -221,8 +304,15 @@ def build_queue(
     promotions_path: Path = LOGS_DIR / "promotions-pending.md",
     ledger_path: Path = LOGS_DIR / "habit-ledger.json",
     carry_judge_path: Path | None = DEFAULT_OUT,
+    trust_effectiveness_path: Path | None = None,
+    trust_overrides_path: Path | None = None,
 ) -> list[QueueItem]:
     """Build a ranked list of self-improvement items from all sources.
+
+    After loading, applies a trust-tier gate: ``status="auto_apply"`` is only
+    kept when the item's type has a trust tier >= 1 (via trust_tiers.get_tier).
+    Items that no longer qualify are downgraded back to ``"queued"``.
+    If trust_tiers cannot be imported the gate fails-closed (no auto_apply).
 
     Args:
         boris_path: Path to boris-candidates.json.
@@ -233,6 +323,10 @@ def build_queue(
         carry_judge_path: Previously saved queue whose judge_* fields are
             carried over by item id (regeneration must not wipe LLM verdicts).
             None disables carry-over.
+        trust_effectiveness_path: Path override for trust_tiers.get_tier
+            (tests inject a tmp path; None uses module default).
+        trust_overrides_path: Path override for trust_tiers.get_tier
+            (tests inject a tmp path; None uses module default).
 
     Returns:
         List of QueueItem sorted by score descending.
@@ -249,17 +343,61 @@ def build_queue(
         prev = {d.get("id"): d for d in load_queue(carry_judge_path)}
         for it in items:
             old = prev.get(it.id)
-            if old and it.judge_score is None and old.get("judge_score") is not None:
+            if not old:
+                continue
+            # Carry judge_score/reason/verdict only when the item has not yet
+            # been scored in this build (avoids clobbering a fresh score).
+            if it.judge_score is None and old.get("judge_score") is not None:
                 it.judge_score = old.get("judge_score")
                 it.judge_reason = old.get("judge_reason", "")
                 it.judge_verdict = old.get("judge_verdict", "")
+            # Always carry judge_fail_count and error verdicts so poisoned items
+            # are not retried after a rebuild when Ollama was genuinely down.
+            if old.get("judge_fail_count", 0) > 0:
+                it.judge_fail_count = old.get("judge_fail_count", 0)
+            if it.judge_verdict == "" and old.get("judge_verdict") == "error":
+                it.judge_verdict = "error"
+                it.judge_reason = old.get("judge_reason", "")
+                it.judge_score = old.get("judge_score", 0.0)
 
-    # Inhibitory feedback: drop items currently in their suppression window
+        # Items the LLM judge already ruled "junk" must not resurface on rebuild.
+        items = [it for it in items if it.judge_verdict != "junk"]
+
+    # Tier gate: auto_apply requires trust tier >= 1.
+    # Items that score >= AUTO_APPLY_THRESHOLD but whose type is Tier 0 are
+    # downgraded back to "queued".  Fail-closed: if trust_tiers is unavailable,
+    # no item is allowed to keep auto_apply status.
+    _tier_cache: dict[str, int] = {}
+
+    def _allowed_auto_apply(item_type: str) -> bool:
+        if item_type not in _tier_cache:
+            try:
+                _tier_cache[item_type] = _get_trust_tier(
+                    item_type,
+                    effectiveness_path=trust_effectiveness_path,
+                    overrides_path=trust_overrides_path,
+                )
+            except Exception:
+                _tier_cache[item_type] = 0  # fail-closed
+        return _tier_cache[item_type] >= 1
+
+    for it in items:
+        if it.status == "auto_apply" and not _allowed_auto_apply(it.type):
+            it.status = "queued"
+
+    # Inhibitory feedback: drop items that are suppressed (dismissed) OR already accepted.
+    # Accepted items must not re-surface — the user has explicitly acted on them.
     try:
         import sys as _sys
         _sys.path.insert(0, str(Path(__file__).parent))
-        from suggestion_feedback import is_suppressed
-        items = [it for it in items if not is_suppressed(it.id, path=_FEEDBACK_PATH)]
+        from suggestion_feedback import is_suppressed, load_feedback
+        _fb = load_feedback(_FEEDBACK_PATH)
+        def _should_drop(it: QueueItem) -> bool:
+            entry = _fb.get(it.id)
+            if entry and entry.get("status") == "accepted":
+                return True
+            return is_suppressed(it.id, path=_FEEDBACK_PATH)
+        items = [it for it in items if not _should_drop(it)]
     except Exception:
         pass
 

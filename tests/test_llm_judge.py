@@ -582,3 +582,623 @@ def test_queue_top_flag(tmp_path, capsys):
     top2 = items[:2]
     assert len(top2) == 2
     assert top2[0].score >= top2[1].score
+
+
+# ---------------------------------------------------------------------------
+# _judge_queue_cmd — batch judging (Task 2b)
+# ---------------------------------------------------------------------------
+
+
+def _stub_judge_fn(verdict: str = "useful", score: float = 0.8, reason: str = "OK"):
+    """Return a judge_text-compatible callable that always returns a fixed verdict."""
+    def _fn(**kwargs):
+        return {"verdict": verdict, "score": score, "reason": reason}
+    return _fn
+
+
+def _stub_judge_fn_down():
+    """Return a judge_text-compatible callable simulating Ollama down (returns None)."""
+    def _fn(**kwargs):
+        return None
+    return _fn
+
+
+def test_batch_judge_exactly_n_unscored(tmp_path):
+    """With 5 unscored items and --limit 3, exactly 3 must be scored."""
+    from llm_judge import _judge_queue_cmd
+
+    queue_path = tmp_path / "queue.json"
+    items = [
+        {"id": f"item-{i}", "type": "habit", "description": f"desc {i}", "score": 0.5}
+        for i in range(5)
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=3,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_stub_judge_fn(),
+    )
+
+    updated = json.loads(queue_path.read_text(encoding="utf-8"))
+    scored = [it for it in updated if it.get("judge_score") is not None]
+    unscored = [it for it in updated if it.get("judge_score") is None]
+    assert len(scored) == 3
+    assert len(unscored) == 2
+
+
+def test_batch_judge_skips_already_scored(tmp_path):
+    """Already-scored items must not be re-judged (idempotent)."""
+    from llm_judge import _judge_queue_cmd
+
+    call_count = {"n": 0}
+
+    def _counting_fn(**kwargs):
+        call_count["n"] += 1
+        return {"verdict": "useful", "score": 0.9, "reason": "ok"}
+
+    queue_path = tmp_path / "queue.json"
+    items = [
+        {"id": "already", "type": "habit", "description": "x", "score": 0.5,
+         "judge_score": 0.7, "judge_verdict": "useful", "judge_reason": "prior"},
+        {"id": "fresh", "type": "habit", "description": "y", "score": 0.5},
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_counting_fn,
+    )
+
+    assert call_count["n"] == 1  # only "fresh" item triggered a call
+    updated = json.loads(queue_path.read_text(encoding="utf-8"))
+    # Pre-existing score must survive unchanged
+    assert updated[0]["judge_score"] == 0.7
+    assert updated[0]["judge_verdict"] == "useful"
+    assert updated[0]["judge_reason"] == "prior"
+    # Fresh item now scored
+    assert updated[1]["judge_score"] == 0.9
+
+
+def test_batch_judge_ollama_down_graceful_exit_0(tmp_path, capsys):
+    """When Ollama is down the run must: exit 0, not raise, item stays unscored.
+
+    With skip+continue semantics, a single failure increments judge_fail_count
+    and persists; judge_score stays None.  The run completes normally (exit 0).
+    """
+    from llm_judge import _judge_queue_cmd
+
+    queue_path = tmp_path / "queue.json"
+    original = [{"id": "x", "type": "habit", "description": "desc", "score": 0.5}]
+    queue_path.write_text(json.dumps(original), encoding="utf-8")
+
+    # Should not raise; returns normally (exit 0)
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=5,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_stub_judge_fn_down(),
+    )
+
+    # Item must remain unscored
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert on_disk[0].get("judge_score") is None, "judge_score must stay None"
+    # fail_count incremented to 1 (persisted)
+    assert on_disk[0].get("judge_fail_count", 0) == 1
+
+
+def test_batch_judge_orders_by_score_highest_first(tmp_path):
+    """Unscored items must be processed highest-score-first so impactful items
+    are covered when max_n < total unscored count."""
+    from llm_judge import _judge_queue_cmd
+
+    judged_ids: list[str] = []
+
+    def _recording_fn(**kwargs):
+        # Extract id from user_text injected into judge_text call
+        return {"verdict": "useful", "score": 0.8, "reason": "ok"}
+
+    # Build queue with varied scores; we track which items get scored
+    queue_path = tmp_path / "queue.json"
+    items = [
+        {"id": "low",  "type": "habit", "description": "a", "score": 0.3},
+        {"id": "high", "type": "habit", "description": "b", "score": 0.9},
+        {"id": "mid",  "type": "habit", "description": "c", "score": 0.6},
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=2,  # only 2 of 3
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_recording_fn,
+    )
+
+    updated = json.loads(queue_path.read_text(encoding="utf-8"))
+    scored_ids = {it["id"] for it in updated if it.get("judge_score") is not None}
+    # "low" (score=0.3) must NOT be among the first 2 judged
+    assert "low" not in scored_ids, "Lowest-score item should not be picked when limit=2"
+    assert "high" in scored_ids
+    assert "mid" in scored_ids
+
+
+def test_batch_judge_verdicts_persist_through_carry_path(tmp_path):
+    """Judge verdicts written by _judge_queue_cmd must survive a queue rebuild
+    via the carry_judge_path merge in build_queue."""
+    from llm_judge import _judge_queue_cmd
+    from self_improvement_queue import build_queue, save_queue
+
+    # Create a minimal queue file with one boris item
+    queue_path = tmp_path / "queue.json"
+    boris = tmp_path / "boris.json"
+    boris.write_text(json.dumps({
+        "projects": {"TestProj": {"count": 4, "examples": ["example"]}}
+    }), encoding="utf-8")
+
+    # Initial build — saves queue so carry_judge_path is populated
+    items = build_queue(
+        boris_path=boris,
+        habits_path=tmp_path / "h.json",
+        graphify_path=tmp_path / "g.json",
+        promotions_path=tmp_path / "p.md",
+        carry_judge_path=None,  # no carry on first build
+    )
+    save_queue(items, path=queue_path)
+
+    # Judge the item
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_stub_judge_fn(verdict="useful", score=0.77, reason="solid"),
+    )
+
+    # Verify judge fields written
+    saved = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert any(it.get("judge_score") == 0.77 for it in saved)
+
+    # Rebuild — carry_judge_path must restore the verdict
+    rebuilt = build_queue(
+        boris_path=boris,
+        habits_path=tmp_path / "h.json",
+        graphify_path=tmp_path / "g.json",
+        promotions_path=tmp_path / "p.md",
+        carry_judge_path=queue_path,
+    )
+    assert any(it.judge_score == 0.77 and it.judge_verdict == "useful" for it in rebuilt), \
+        "judge_score/verdict must survive rebuild via carry_judge_path"
+
+
+# ---------------------------------------------------------------------------
+# Incremental persist + partial-stop messages (real-world timeout fix)
+# ---------------------------------------------------------------------------
+
+
+def _make_partial_judge_fn(succeed_ids: list[str]):
+    """Return a judge_fn that succeeds for items in succeed_ids, returns None for others."""
+    def _fn(system_prompt: str, user_text: str, **kwargs) -> dict | None:
+        # Extract item id from user_text ("Queue item id: <id>\n...")
+        for line in user_text.splitlines():
+            if line.startswith("Queue item id:"):
+                item_id = line.split(":", 1)[1].strip()
+                if item_id in succeed_ids:
+                    return {"verdict": "useful", "score": 0.75, "reason": "ok"}
+                return None
+        return None
+    return _fn
+
+
+def test_partial_stop_persists_already_scored(tmp_path):
+    """Fail on item c (after a,b succeed) — a and b are on disk, c has fail_count=1."""
+    from llm_judge import _judge_queue_cmd
+
+    queue_path = tmp_path / "queue.json"
+    # 3 items; highest score first → "a" then "b" then "c"
+    items = [
+        {"id": "a", "type": "habit", "description": "d", "score": 0.9},
+        {"id": "b", "type": "habit", "description": "d", "score": 0.7},
+        {"id": "c", "type": "habit", "description": "d", "score": 0.5},
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_make_partial_judge_fn(succeed_ids=["a", "b"]),
+    )
+
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    by_id = {it["id"]: it for it in on_disk}
+
+    # a and b must be scored
+    assert by_id["a"].get("judge_score") == 0.75, "item a must be persisted"
+    assert by_id["b"].get("judge_score") == 0.75, "item b must be persisted"
+    # c failed once: still unscored but fail_count incremented
+    assert by_id["c"].get("judge_score") is None, "item c must remain unscored"
+    assert by_id["c"].get("judge_fail_count", 0) == 1, "item c must have fail_count=1"
+
+
+def test_partial_stop_message_single_failure_skip_continues(tmp_path, capsys):
+    """A single None (first=success, second=fail) must not stop the run early.
+    The run skips 'second', continues, finishes, and prints 'judged 1 queue items'."""
+    from llm_judge import _judge_queue_cmd
+
+    queue_path = tmp_path / "queue.json"
+    items = [
+        {"id": "first",  "type": "habit", "description": "d", "score": 0.9},
+        {"id": "second", "type": "habit", "description": "d", "score": 0.7},
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_make_partial_judge_fn(succeed_ids=["first"]),
+    )
+
+    # Run completed normally — must print the summary line
+    captured = capsys.readouterr()
+    msg = captured.out
+    assert "judged 1 queue items" in msg, \
+        f"Expected summary 'judged 1 queue items'; got: {msg!r}"
+
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    by_id = {it["id"]: it for it in on_disk}
+    assert by_id["first"].get("judge_score") == 0.75
+    assert by_id["second"].get("judge_score") is None
+    assert by_id["second"].get("judge_fail_count", 0) == 1
+
+
+def test_zero_judged_single_failure_increments_fail_count(tmp_path, capsys):
+    """When judged==0 and one item fails, fail_count=1 is persisted; item stays unscored."""
+    from llm_judge import _judge_queue_cmd
+
+    queue_path = tmp_path / "queue.json"
+    items = [{"id": "only", "type": "habit", "description": "d", "score": 0.5}]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=5,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_stub_judge_fn_down(),
+    )
+
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert on_disk[0].get("judge_score") is None, "judge_score must remain None"
+    assert on_disk[0].get("judge_fail_count", 0) == 1, "fail_count must be 1"
+
+
+def test_incremental_persist_each_item(tmp_path):
+    """Each scored item must be written to disk immediately, not only at the end."""
+    from llm_judge import _judge_queue_cmd
+
+    written_after: list[int] = []  # count of scored items on disk after each call
+
+    queue_path = tmp_path / "queue.json"
+    items = [
+        {"id": f"item-{i}", "type": "habit", "description": "d", "score": 0.5 - i * 0.1}
+        for i in range(3)
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    call_n = {"n": 0}
+
+    def _spy_fn(**kwargs):
+        call_n["n"] += 1
+        result = {"verdict": "useful", "score": 0.8, "reason": "ok"}
+        # After returning, the caller writes to disk; we check on the NEXT call
+        return result
+
+    # Wrap _judge_queue_cmd with a spy that reads disk state mid-run.
+    # We achieve this by injecting a fn that, before returning, records current
+    # disk state (which reflects the PREVIOUS item's persist).
+    disk_states: list[int] = []
+
+    def _recording_fn(**kwargs):
+        # Read current disk state (items scored so far from previous iterations)
+        try:
+            current = json.loads(queue_path.read_text(encoding="utf-8"))
+            n_scored = sum(1 for it in current if it.get("judge_score") is not None)
+            disk_states.append(n_scored)
+        except Exception:
+            disk_states.append(0)
+        return {"verdict": "useful", "score": 0.8, "reason": "ok"}
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=3,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_recording_fn,
+    )
+
+    # After all 3 items, disk must have 3 scored
+    final = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert sum(1 for it in final if it.get("judge_score") is not None) == 3
+
+    # disk_states captured BEFORE each write: [0, 1, 2] — proves each item
+    # is persisted immediately after the previous one.
+    assert disk_states == [0, 1, 2], \
+        f"Per-item incremental persist expected [0,1,2]; got {disk_states}"
+
+
+def test_queue_timeout_default_is_120_in_cli(tmp_path):
+    """When --timeout is not given, --judge-queue must use 120 s (not 60 s)."""
+    # We verify the constant _QUEUE_TIMEOUT and that main() routes to it.
+    from llm_judge import _QUEUE_TIMEOUT
+    assert _QUEUE_TIMEOUT == 120, f"Expected _QUEUE_TIMEOUT=120; got {_QUEUE_TIMEOUT}"
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker + permanent error marking (task 3)
+# ---------------------------------------------------------------------------
+
+
+def _make_sequence_fn(results: list):
+    """Return a judge_fn that pops from *results* in order.
+    Each entry is either a dict (success) or None (failure).
+    """
+    seq = list(results)  # copy so the original is not mutated
+
+    def _fn(**kwargs):
+        if not seq:
+            return {"verdict": "useful", "score": 0.5, "reason": "fallback"}
+        return seq.pop(0)
+
+    return _fn
+
+
+def test_fail_success_success_judged_2_fail_count_1(tmp_path):
+    """fail, success, success → judged=2; failed item has fail_count=1, still unscored."""
+    from llm_judge import _judge_queue_cmd
+
+    queue_path = tmp_path / "queue.json"
+    items = [
+        {"id": "poison", "type": "habit", "description": "d", "score": 0.9},
+        {"id": "good1",  "type": "habit", "description": "d", "score": 0.7},
+        {"id": "good2",  "type": "habit", "description": "d", "score": 0.5},
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    # poison → None; good1 → success; good2 → success
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_make_sequence_fn([
+            None,
+            {"verdict": "useful", "score": 0.8, "reason": "ok"},
+            {"verdict": "junk",   "score": 0.2, "reason": "noise"},
+        ]),
+    )
+
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    by_id = {it["id"]: it for it in on_disk}
+
+    assert by_id["good1"]["judge_score"] == 0.8, "good1 must be scored"
+    assert by_id["good2"]["judge_score"] == 0.2, "good2 must be scored"
+    # poison: first failure → still unscored, fail_count=1, NOT error verdict
+    assert by_id["poison"].get("judge_score") is None, "poison must remain unscored"
+    assert by_id["poison"].get("judge_fail_count", 0) == 1
+    assert by_id["poison"].get("judge_verdict", "") != "error", \
+        "single failure must not permanently mark as error"
+
+
+def test_three_consecutive_failures_trigger_breaker(tmp_path, capsys):
+    """3 consecutive None results must trigger the circuit breaker and stop the run."""
+    from llm_judge import _judge_queue_cmd, _CONSECUTIVE_FAILURE_LIMIT
+
+    assert _CONSECUTIVE_FAILURE_LIMIT == 3
+
+    queue_path = tmp_path / "queue.json"
+    items = [
+        {"id": f"item-{i}", "type": "habit", "description": "d", "score": 0.9 - i * 0.1}
+        for i in range(5)
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_stub_judge_fn_down(),  # always None
+    )
+
+    captured = capsys.readouterr()
+    msg = captured.out
+    assert "consecutive" in msg.lower() or "ollama down" in msg.lower(), \
+        f"Breaker message expected; got: {msg!r}"
+    assert "judged 0" in msg, f"Expected 'judged 0' in breaker message; got: {msg!r}"
+
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    # No item must be permanently marked error yet (consecutive limit hit at count=3,
+    # but each individual fail_count is only 1 — no item reached fail_count=2)
+    for it in on_disk:
+        assert it.get("judge_verdict", "") != "error", \
+            f"Item {it['id']!r} must not be permanently marked after breaker run"
+
+
+def test_second_failure_permanently_marks_error(tmp_path, capsys):
+    """An item that fails twice across two runs gets verdict='error', score=0.0."""
+    from llm_judge import _judge_queue_cmd
+
+    queue_path = tmp_path / "queue.json"
+    # Start with fail_count=1 already on disk (simulates previous run failure)
+    items = [
+        {"id": "poison", "type": "habit", "description": "d", "score": 0.9,
+         "judge_fail_count": 1},
+        {"id": "good",   "type": "habit", "description": "d", "score": 0.5},
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    # poison → None again (second failure); good → success
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_make_sequence_fn([
+            None,
+            {"verdict": "useful", "score": 0.8, "reason": "ok"},
+        ]),
+    )
+
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    by_id = {it["id"]: it for it in on_disk}
+
+    # poison permanently marked
+    assert by_id["poison"]["judge_verdict"] == "error", \
+        "Second failure must set verdict=error"
+    assert by_id["poison"]["judge_score"] == 0.0
+    assert by_id["poison"]["judge_fail_count"] == 2
+    assert "2 attempts" in by_id["poison"].get("judge_reason", ""), \
+        "Reason must mention 2 attempts"
+
+    # good scored normally
+    assert by_id["good"]["judge_score"] == 0.8
+
+    # error item must print a message mentioning the id
+    captured = capsys.readouterr()
+    assert "poison" in captured.out, \
+        f"Expected item id 'poison' in error-mark message; got: {captured.out!r}"
+
+
+def test_error_marked_item_excluded_from_future_batches(tmp_path):
+    """An item with judge_fail_count=2 and verdict='error' must not appear in to_judge."""
+    from llm_judge import _judge_queue_cmd
+
+    call_count = {"n": 0}
+
+    def _counting_fn(**kwargs):
+        call_count["n"] += 1
+        return {"verdict": "useful", "score": 0.9, "reason": "ok"}
+
+    queue_path = tmp_path / "queue.json"
+    items = [
+        # permanently error-marked item
+        {"id": "blocked", "type": "habit", "description": "d", "score": 0.9,
+         "judge_fail_count": 2, "judge_verdict": "error", "judge_score": 0.0},
+        # normal unscored item
+        {"id": "fresh", "type": "habit", "description": "d", "score": 0.5},
+    ]
+    queue_path.write_text(json.dumps(items), encoding="utf-8")
+
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_counting_fn,
+    )
+
+    # Only 'fresh' should have been judged — 'blocked' is excluded
+    assert call_count["n"] == 1, \
+        f"Expected exactly 1 LLM call (only 'fresh'); got {call_count['n']}"
+
+    on_disk = json.loads(queue_path.read_text(encoding="utf-8"))
+    by_id = {it["id"]: it for it in on_disk}
+    assert by_id["blocked"]["judge_verdict"] == "error", "blocked must stay error"
+    assert by_id["fresh"]["judge_score"] == 0.9
+
+
+def test_judge_fail_count_survives_rebuild(tmp_path):
+    """judge_fail_count must be carried through a build_queue rebuild."""
+    from llm_judge import _judge_queue_cmd
+    from self_improvement_queue import build_queue, save_queue
+
+    boris = tmp_path / "boris.json"
+    boris.write_text(json.dumps({
+        "projects": {"TestProj": {"count": 4, "examples": ["x"]}}
+    }), encoding="utf-8")
+    queue_path = tmp_path / "queue.json"
+
+    # Build + save initial queue
+    initial = build_queue(
+        boris_path=boris,
+        habits_path=tmp_path / "h.json",
+        graphify_path=tmp_path / "g.json",
+        promotions_path=tmp_path / "p.md",
+        carry_judge_path=None,
+    )
+    save_queue(initial, path=queue_path)
+
+    # Simulate a failed judge run — item gets fail_count=1
+    _judge_queue_cmd(
+        queue_path=queue_path,
+        max_n=10,
+        model="test",
+        base_url="http://x",
+        timeout=5,
+        judge_text_fn=_stub_judge_fn_down(),
+    )
+
+    # Verify fail_count written
+    saved = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert any(it.get("judge_fail_count", 0) == 1 for it in saved), \
+        "At least one item must have judge_fail_count=1 after failed run"
+
+    # Rebuild — carry_judge_path must restore fail_count
+    rebuilt = build_queue(
+        boris_path=boris,
+        habits_path=tmp_path / "h.json",
+        graphify_path=tmp_path / "g.json",
+        promotions_path=tmp_path / "p.md",
+        carry_judge_path=queue_path,
+    )
+    assert any(it.judge_fail_count == 1 for it in rebuilt), \
+        "judge_fail_count=1 must survive rebuild via carry_judge_path"
+
+
+# ── _purge_rejected: TTL GC of the rejected-drafts dir (2026-06-13) ──────────
+
+def test_purge_rejected_removes_old_only(tmp_path):
+    import os, time
+    from llm_judge import _purge_rejected
+    rej = tmp_path / "skill-drafts-rejected"
+    rej.mkdir()
+    old = rej / "old-junk"; old.mkdir()
+    new = rej / "fresh-junk"; new.mkdir()
+    now = 1_000_000_000.0
+    os.utime(old, (now - 40 * 86400, now - 40 * 86400))  # 40 days old
+    os.utime(new, (now - 5 * 86400, now - 5 * 86400))     # 5 days old
+    # DRY run counts but does not delete.
+    assert _purge_rejected(rej, older_than_days=30, apply=False, now=now) == 1
+    assert old.exists()
+    # APPLY removes only the old dir.
+    assert _purge_rejected(rej, older_than_days=30, apply=True, now=now) == 1
+    assert not old.exists()
+    assert new.exists()
+
+
+def test_purge_rejected_missing_dir_safe(tmp_path):
+    from llm_judge import _purge_rejected
+    assert _purge_rejected(tmp_path / "nope", older_than_days=30, apply=True) == 0

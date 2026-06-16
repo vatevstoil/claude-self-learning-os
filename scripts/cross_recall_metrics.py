@@ -139,29 +139,46 @@ def compute(days: int, now: datetime | None = None) -> dict:
     surfaced = [s for e in events for s in (e.get("surfaced") or [])]
     n_surfaced = len(surfaced)
 
-    rerecalled = explicit = engaged = 0
     scores: list[float] = []
+    snippet_lens: list[int] = []
     per_project: dict[str, dict[str, int]] = {}
+
+    # unique_rr_ids and unique_ex_ids deduplicate across surfacing events:
+    # the same vector id may appear in multiple sessions (double-count bug).
+    # We count engagement per UNIQUE vector id, not per surfacing occurrence.
+    unique_rr_ids: set[str] = set()
+    unique_ex_ids: set[str] = set()
+    # per_project still counts surfacing occurrences (same id in different
+    # projects counts once per project), matching the per_project semantics.
 
     # map surfaced item -> its project (events carry project)
     for e in events:
         proj = _enc_guard(e.get("project") or "?")
         pp = per_project.setdefault(proj, {"surfaced": 0, "engaged": 0})
+        # Track which ids have been engaged in THIS project already
+        proj_engaged_ids: set[str] = set()
         for s in (e.get("surfaced") or []):
             vid = s.get("id") or ""
             sc = float(s.get("score", 0.0))
             scores.append(sc)
+            snippet_lens.append(len(s.get("t", "") or ""))
             hc_now = int(tracker.get(vid, {}).get("hit_count", 0))
             is_rr = hc_now > int(s.get("hc0", 0))
             is_ex = vid in used_ids
             if is_rr:
-                rerecalled += 1
+                unique_rr_ids.add(vid)
             if is_ex:
-                explicit += 1
-            if is_rr or is_ex:
-                engaged += 1
+                unique_ex_ids.add(vid)
+            if (is_rr or is_ex) and vid not in proj_engaged_ids:
                 pp["engaged"] += 1
+                proj_engaged_ids.add(vid)
             pp["surfaced"] += 1
+
+    rerecalled = len(unique_rr_ids)
+    explicit = len(unique_ex_ids)
+    # unique_engaged: ids that were re-recalled OR explicitly used (deduplicated)
+    unique_engaged_ids = unique_rr_ids | unique_ex_ids
+    engaged = len(unique_engaged_ids)
 
     rate = round(engaged / n_surfaced, 3) if n_surfaced else 0.0
     return {
@@ -172,12 +189,17 @@ def compute(days: int, now: datetime | None = None) -> dict:
         "enriched_pct": round(100 * n_enriched / n_events, 1) if n_events else 0.0,
         "surfaced": n_surfaced,
         "avg_score": round(sum(scores) / len(scores), 4) if scores else 0.0,
+        "snippet_len_avg": round(sum(snippet_lens) / len(snippet_lens), 1) if snippet_lens else 0.0,
         "rerecalled": rerecalled,
         "explicit_used": explicit,
         "engaged": engaged,
+        "unique_engaged": engaged,  # explicit alias for clarity
         "engagement_rate": rate,
         "per_project": per_project,
-        "note": "engagement_rate is a LOWER BOUND (re-recall proxy); true usefulness >= this.",
+        "note": (
+            "engagement_rate is a LOWER BOUND (re-recall proxy); true usefulness >= this. "
+            "engaged/rerecalled count UNIQUE vector ids (deduped across surfacing events)."
+        ),
     }
 
 

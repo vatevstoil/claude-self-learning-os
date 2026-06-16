@@ -70,6 +70,20 @@ def contains_secret(text: str) -> bool:
     return bool(text) and any(p.search(text) for p in _SECRET_RE)
 
 
+def _blocks_pii(text: str) -> bool:
+    """True if `text` carries HIGH-confidence personal data (EGN / card / IBAN /
+    sealed legal-case marker). Complements contains_secret, which covers only
+    credentials. Lazy + tolerant: if pii_scanner is unavailable for any reason,
+    fall back to allowing — the secret gate still runs and we never crash ingest."""
+    if not text:
+        return False
+    try:
+        import pii_scanner
+        return pii_scanner.should_block_ingest(text)
+    except Exception:
+        return False
+
+
 def backup(dest: str | None = None) -> str:
     """Consistent online snapshot of the DB via the sqlite backup API (safe even
     while other processes are writing). Returns the backup path."""
@@ -123,9 +137,20 @@ def _normalize(vec: list) -> bytes:
 
 
 def upsert_vec(ns: str, vid: str, vec: list, text: str, meta: dict | None = None) -> None:
-    """Store an already-embedded vector (used by retrofitted Pinecone importers)."""
+    """Store an already-embedded vector (used by retrofitted Pinecone importers).
+
+    The secret and PII gates apply to `text` here too — bulk importers call this
+    directly (bypassing upsert()), so the guards must live at the storage layer.
+    Triggering content is silently skipped (stderr note), never persisted.
+    """
     if len(vec) != EXPECTED_DIM:
         raise ValueError(f"vec dim {len(vec)} != {EXPECTED_DIM}")
+    if contains_secret(text or ""):
+        print(f"  [secret] SKIP {ns}/{vid} — credential-like content not stored", file=sys.stderr)
+        return
+    if _blocks_pii(text or ""):
+        print(f"  [pii] SKIP {ns}/{vid} — personal data (EGN/card/IBAN/legal) not stored", file=sys.stderr)
+        return
     c = _conn()
     try:
         c.execute(
@@ -144,7 +169,12 @@ def upsert(ns: str, vid: str, text: str, meta: dict | None = None) -> bool:
     if contains_secret(text):
         print(f"  [secret] SKIP {ns}/{vid} — credential-like content not stored", file=sys.stderr)
         return False
-    upsert_vec(ns, vid, local_embed(text), text, meta)
+    if _blocks_pii(text):
+        print(f"  [pii] SKIP {ns}/{vid} — personal data (EGN/card/IBAN/legal) not stored", file=sys.stderr)
+        return False
+    # timeout=6: Ollama slow → socket.timeout → PineconeError → cmd_save queues to
+    # pending-saves.jsonl → exit 3. Hook completes in <8s instead of hanging 60s+.
+    upsert_vec(ns, vid, local_embed(text, timeout=6), text, meta)
     return True
 
 
@@ -407,7 +437,7 @@ def index_files(ns: str, patterns: list) -> dict:
     for pat in patterns:
         files.extend(Path(f) for f in globmod.glob(pat, recursive=True))
     files = [f for f in files if f.is_file()]
-    n_chunks, skipped = 0, 0
+    n_chunks, skipped, skipped_pii = 0, 0, 0
     BATCH = 32
     pending = []  # (id, text, meta)
 
@@ -431,12 +461,17 @@ def index_files(ns: str, patterns: list) -> dict:
                 skipped += 1
                 print(f"  [secret] SKIP {f.name}#{ci}", file=sys.stderr)
                 continue
+            if _blocks_pii(chunk):
+                skipped_pii += 1
+                print(f"  [pii] SKIP {f.name}#{ci} — personal data not stored", file=sys.stderr)
+                continue
             h = hashlib.sha256(f"{f}|{ci}|{chunk[:64]}".encode("utf-8")).hexdigest()[:16]
             pending.append((h, chunk, {"text": chunk[:2000], "source": str(f), "chunk": ci}))
             if len(pending) >= BATCH:
                 _flush()
     _flush()
-    return {"files": len(files), "chunks": n_chunks, "skipped_secret": skipped}
+    return {"files": len(files), "chunks": n_chunks,
+            "skipped_secret": skipped, "skipped_pii": skipped_pii}
 
 
 # ---------------------------------------------------------------------------

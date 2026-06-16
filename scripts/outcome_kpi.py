@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from core_io import load_json_tolerant
+
 # ---------------------------------------------------------------------------
 # Default paths (all DI-injectable for tests)
 # ---------------------------------------------------------------------------
@@ -41,10 +43,7 @@ _DEFAULT_LATEST = _LOGS / "outcome-kpi.json"
 
 def _load_json(path: Path) -> Any:
     """Load JSON file; return None on any error."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return load_json_tolerant(path, None)
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -98,6 +97,7 @@ def compute_repeat_rate(
 
     corrections_total = 0
     repeats = 0
+    seen_timestamps: set[str] = set()
 
     clusters = state.get("clusters", []) if isinstance(state, dict) else []
     for cluster in clusters:
@@ -124,29 +124,66 @@ def compute_repeat_rate(
                 continue
 
             corrections_total += 1
+            seen_timestamps.add(seen.isoformat())
 
             # It's a repeat if the cluster existed BEFORE the window
             if first_seen is not None and first_seen < window_start:
                 repeats += 1
 
+    # Garbage-in guard: many corrections collapsed onto ONE timestamp is the
+    # signature of a bulk import (first_seen==seen on every row) — there is no
+    # temporal signal, so a 0.0 rate would be vacuously "perfect" and
+    # misleading. Small-n with a single timestamp is left measurable (a lone
+    # recurrence is legitimate). Threshold 3 = can't get 3 genuine corrections
+    # at the identical instant without a bulk stamp.
+    #
+    # Exception: if repeats > 0, we have at least one cluster whose first_seen
+    # predates the window — this is a genuine recurrence signal even when all
+    # "seen" timestamps share a single bulk-import value.  In that case the
+    # rate is real and must not be suppressed.
+    bulk_only_noise = corrections_total >= 3 and len(seen_timestamps) <= 1 and repeats == 0
+    if bulk_only_noise:
+        return {"total": corrections_total, "repeats": repeats,
+                "rate": None, "measurable": False,
+                "note": "single-timestamp bulk data — no temporal signal"}
+
     rate = repeats / corrections_total if corrections_total > 0 else 0.0
+    return {"total": corrections_total, "repeats": repeats,
+            "rate": round(rate, 4), "measurable": True}
 
-    return {"total": corrections_total, "repeats": repeats, "rate": round(rate, 4)}
 
-
-def _compute_recall_engagement(recall_path: Path) -> dict[str, Any]:
+def _compute_recall_engagement(recall_path: Path,
+                               now: datetime | None = None) -> dict[str, Any]:
     """Extract recall engagement from cross-recall-metrics.json.
 
-    Returns nulls when the file is missing or corrupt.
+    Returns nulls when the file is missing or corrupt. Annotates staleness:
+    metrics older than 24h are flagged so the dashboard never treats a stale
+    snapshot as current truth.
     """
     data = _load_json(recall_path)
     if not isinstance(data, dict):
         return {"surfaced": None, "engaged": None, "rate": None}
-    return {
+    out: dict[str, Any] = {
         "surfaced": data.get("surfaced"),
         "engaged": data.get("engaged"),
         "rate": data.get("engagement_rate"),
     }
+    # Staleness annotation.
+    if now is None:
+        now = datetime.now(timezone.utc)
+    gen_raw = data.get("generated", "")
+    try:
+        gen = datetime.fromisoformat(gen_raw)
+        if gen.tzinfo is None:
+            gen = gen.replace(tzinfo=timezone.utc)
+        age_h = (now - gen).total_seconds() / 3600.0
+        if age_h > 24:
+            out["stale"] = True
+            out["stale_hours"] = round(age_h, 1)
+    except Exception:
+        out["stale"] = True
+        out["stale_hours"] = None
+    return out
 
 
 def _compute_apply_funnel(
@@ -163,6 +200,10 @@ def _compute_apply_funnel(
     - open_incidents: number of open incidents in incidents.json
     """
     cutoff_30d = now - timedelta(days=30)
+
+    # Distinguish "no ledger yet" (first auto-apply never ran) from "truly 0
+    # applied" — otherwise a missing file reads as a confident zero.
+    ledger_missing = not Path(ledger_path).exists()
 
     applied_30d = 0
     rolled_back_30d = 0
@@ -199,10 +240,11 @@ def _compute_apply_funnel(
         open_incidents = 0
 
     return {
-        "applied_30d": applied_30d,
-        "rolled_back_30d": rolled_back_30d,
+        "applied_30d": None if ledger_missing else applied_30d,
+        "rolled_back_30d": None if ledger_missing else rolled_back_30d,
         "queue_depth": queue_depth,
         "open_incidents": open_incidents,
+        "ledger_missing": ledger_missing,
     }
 
 
@@ -216,6 +258,9 @@ def _compute_trend(current_rate: float, history_path: Path,
 
     Returns one of: "improving", "degrading", "flat", "insufficient_data".
     """
+    # No measurable current rate (e.g. bulk-only data) → no trend to compute.
+    if current_rate is None:
+        return "insufficient_data"
     rows = _load_jsonl(history_path)
     if not rows:
         return "insufficient_data"
@@ -281,7 +326,7 @@ def compute_kpi(
     repeat_corrections = compute_repeat_rate(state_data, window_days=window_days, now=now)
 
     # 2. Recall engagement
-    recall_engagement = _compute_recall_engagement(recall_path)
+    recall_engagement = _compute_recall_engagement(recall_path, now=now)
 
     # 3. Apply funnel
     apply_funnel = _compute_apply_funnel(

@@ -135,35 +135,122 @@ def check_runs(text: str) -> tuple[int, list[str]]:
     now = datetime.now()
     daily = _last_ts(text, "DAILY RUN END")
     weekly = _last_ts(text, "WEEKLY RUN END")
+    # Dreaming is scheduled weekly (Sat 11:00) — same 8-day staleness budget as
+    # weekly. Without this check a broken dreaming pipeline dies silently while
+    # daily/weekly keep health green.
+    dreaming = _last_ts(text, "DREAMING RUN END")
     score = 100
     if daily is None or (now - daily) > timedelta(days=2):
         issues.append("daily run not seen in last 48h")
         score -= 50
     if weekly is None or (now - weekly) > timedelta(days=8):
         issues.append("weekly run not seen in last 8 days")
-        score -= 50
+        score -= 25
+    if dreaming is None or (now - dreaming) > timedelta(days=8):
+        issues.append("dreaming run not seen in last 8 days")
+        score -= 25
     return max(0, score), issues
 
 
 # --------------------------------------------------------------------------- errors
-def check_errors(text: str) -> tuple[int, list[str]]:
-    """Inspect the LAST weekly block for real script failures."""
-    issues: list[str] = []
-    starts = [i for i, ln in enumerate(text.splitlines()) if "WEEKLY RUN START" in ln]
+_RC_RE = re.compile(r"(\w[\w.-]*\.py):\s*rc=(\d+)")
+_TS_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def check_errors(
+    text: str,
+    *,
+    window_days: int = 7,
+    now: datetime | None = None,
+) -> tuple[int, list[str]]:
+    """Detect real script failures using a 7-day sliding window with last-state-wins.
+
+    Two bugs fixed from the original:
+
+    1. **Only last WEEKLY block**: the old code found WEEKLY RUN START markers and
+       took only lines after the last one.  On systems that run daily-only (no
+       weekly cron yet), or when the weekly block predates the 7-day window,
+       this returned (100, []) — hiding real failures.  Now we use a 7-day
+       time-window over ALL log lines regardless of block type.
+
+    2. **History counted, not current state**: if a script failed on day 1 then
+       succeeded on day 2, the failure was still counted.  Fix: for each script
+       track the LAST seen rc.  A fixed script (last rc=0) is NOT counted as a
+       failure.  Same for TIMEOUT and [ERROR]/[CRITICAL] lines: if the script
+       ran successfully after the bad line, the bad line is cleared.
+
+    semantic_merge (and other special scripts) remain "unverified" until they
+    show a confirmed rc=0 — they are not in SEMANTIC_NONZERO so non-zero is an
+    error, but if their last run was clean they are cleared.
+    """
+    _now = now or datetime.now()
+    cutoff = _now - timedelta(days=window_days)
+
     lines = text.splitlines()
-    if not starts:
-        return 100, []  # no weekly block yet — neutral
-    block = lines[starts[-1]:]
-    for ln in block:
-        m = re.search(r"(\w+\.py):\s*rc=(\d+)", ln)
-        if m:
-            script, rc = m.group(1), int(m.group(2))
-            if rc != 0 and script not in SEMANTIC_NONZERO:
-                issues.append(f"{script} rc={rc}")
+
+    # Per-script tracking: last_rc, last_timeout, last_error_line
+    # key = script name, value = dict with 'rc', 'timeout', 'error'
+    script_state: dict[str, dict] = {}
+
+    for ln in lines:
+        # Parse timestamp to apply the 7-day window
+        m_ts = _TS_RE.match(ln)
+        if m_ts:
+            try:
+                ts = datetime.strptime(m_ts.group(1), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                ts = _now  # can't parse → include (safe default)
+        else:
+            ts = _now  # no timestamp → include
+
+        if ts < cutoff:
+            continue  # outside the 7-day window
+
+        # rc lines
+        m_rc = _RC_RE.search(ln)
+        if m_rc:
+            script, rc = m_rc.group(1), int(m_rc.group(2))
+            state = script_state.setdefault(script, {"rc": None, "timeout": False, "error": None})
+            state["rc"] = rc
+            if rc == 0:
+                # Successful run clears previous timeout/error for this script
+                state["timeout"] = False
+                state["error"] = None
+            continue
+
+        # TIMEOUT lines (associate with the script name if detectable)
         if "TIMEOUT" in ln:
-            issues.append(ln.split("]", 1)[-1].strip()[:80])
+            # Try to extract script name from context like "Starting: foo.py"
+            m_name = re.search(r"(\w[\w.-]*\.py)", ln)
+            key = m_name.group(1) if m_name else f"__timeout_{ln[:30]}"
+            state = script_state.setdefault(key, {"rc": None, "timeout": False, "error": None})
+            state["timeout"] = True
+            continue
+
+        # [ERROR] / [CRITICAL] lines (not associated with a specific script —
+        # keep as free-form issue; cleared only if no subsequent occurrences)
         if "[ERROR]" in ln or "[CRITICAL]" in ln:
-            issues.append(ln.split("]", 1)[-1].strip()[:80])
+            msg = ln.split("]", 1)[-1].strip()[:80]
+            key = f"__log_{msg[:40]}"
+            state = script_state.setdefault(key, {"rc": None, "timeout": False, "error": None})
+            state["error"] = msg
+
+    # Evaluate last-state per script
+    issues: list[str] = []
+    for script, state in script_state.items():
+        if script.startswith("__timeout_"):
+            if state["timeout"]:
+                issues.append(script.replace("__timeout_", "TIMEOUT: ")[:80])
+        elif script.startswith("__log_"):
+            if state["error"]:
+                issues.append(state["error"])
+        else:
+            rc = state["rc"]
+            if rc is not None and rc != 0 and script not in SEMANTIC_NONZERO:
+                issues.append(f"{script} rc={rc}")
+            if state["timeout"]:
+                issues.append(f"TIMEOUT: {script}")
+
     # Embedding-quota backlog: queued saves = learnings not yet in recall (quota
     # outage). Surface it (and the remedy) so SessionStart shows the degradation.
     try:
@@ -173,6 +260,7 @@ def check_errors(text: str) -> tuple[int, list[str]]:
                 issues.append(f"{n} saves queued (Pinecone quota) — run pinecone.py replay-queue")
     except Exception:
         pass
+
     score = 100 if not issues else max(0, 100 - 25 * len(issues))
     return score, issues
 

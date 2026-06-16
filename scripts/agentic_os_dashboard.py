@@ -40,6 +40,9 @@ LOGS = CLAUDE / "logs"
 REPORTS = CLAUDE / "reports"
 META = Path(r"{{WIKI_PATH}}\_meta")
 OUT_HTML = REPORTS / "agentic-os-dashboard.html"
+GEMINI_TASKS = CLAUDE / "gemini-tasks"
+RESEARCH_BASE = Path(r"{{RESEARCH_PATH}}\General Research")
+RESEARCH_TRANSCRIPTS = RESEARCH_BASE / "raw" / "transcripts"
 
 PYEXE = sys.executable or "python"
 
@@ -53,6 +56,8 @@ ACTIONS = {
     "graphify":  ("Build missing graphs", [PYEXE, str(SCRIPTS / "auto_graphify.py")]),
     "health":    ("Health check",         [PYEXE, str(SCRIPTS / "selfreg_monitor.py")]),
     "freshness": ("Wiki freshness",       [PYEXE, str(SCRIPTS / "wiki_freshness_check.py"), "--threshold", "14"]),
+    "integrity": ("Integrity check",      [PYEXE, str(SCRIPTS / "integrity_guard.py")]),
+    "abeval":    ("A/B eval",             [PYEXE, str(SCRIPTS / "ab_eval.py")]),
 }
 
 
@@ -63,6 +68,23 @@ def _load(path: Path, default=None):
         return default if default is not None else {}
 
 
+def _find_entity_files() -> list[dict]:
+    """Return [{slug, path, n_entities, n_relations}] for all entities.json files, newest first."""
+    if not RESEARCH_TRANSCRIPTS.exists():
+        return []
+    out = []
+    for p in sorted(RESEARCH_TRANSCRIPTS.glob("*.entities.json"),
+                    key=lambda x: x.stat().st_mtime, reverse=True):
+        slug = p.stem.replace(".entities", "")
+        try:
+            d = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            ne, nr = len(d.get("entities", [])), len(d.get("relations", []))
+        except Exception:
+            ne, nr = 0, 0
+        out.append({"slug": slug, "path": str(p), "n_entities": ne, "n_relations": nr})
+    return out
+
+
 def collect_state() -> dict:
     health = _load(LOGS / "selfreg-health.json")
     roi = _load(LOGS / "roi.json")
@@ -70,6 +92,11 @@ def collect_state() -> dict:
     registry = _load(META / "domain-registry.json")
     graphq = _load(LOGS / "graphify-queue.json")
     dreaming = _load(REPORTS / "dreaming-latest.json")
+    integrity = _load(LOGS / "integrity-report.json")
+    abeval = _load(LOGS / "ab-eval.json")
+    kpi = _load(LOGS / "outcome-kpi.json")
+    incidents = _load(LOGS / "incidents.json")
+    fixproposals = _load(LOGS / "fix-proposals.json")
     # trend: last 10 health snapshots
     trend = []
     hist = LOGS / "selfreg-history.jsonl"
@@ -80,10 +107,24 @@ def collect_state() -> dict:
                 trend.append({"date": d.get("date"), "overall": d.get("overall")})
             except Exception:
                 pass
+    # Gemini briefs: count + up to 5 newest filenames (missing dir → empty, never crash)
+    gemini_briefs: dict = {"count": 0, "recent": []}
+    try:
+        if GEMINI_TASKS.is_dir():
+            mds = sorted(GEMINI_TASKS.glob("*.md"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+            gemini_briefs = {"count": len(mds), "recent": [p.name for p in mds[:5]]}
+    except Exception:
+        pass
+    research_files = _find_entity_files()
     return {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "health": health, "roi": roi, "freshness": freshness,
         "registry": registry, "graphq": graphq, "dreaming": dreaming, "trend": trend,
+        "integrity": integrity, "abeval": abeval, "kpi": kpi,
+        "incidents": incidents, "fixproposals": fixproposals,
+        "gemini_briefs": gemini_briefs,
+        "research": {"files": research_files, "count": len(research_files)},
         "actions": {k: v[0] for k, v in ACTIONS.items()},
     }
 
@@ -134,12 +175,12 @@ card('Self-Regulation Health',
    <div class="mut">${(h.components?Object.entries(h.components).map(([k,v])=>k+' '+v).join(' · '):'')}</div></div></div>`);
 
 // ROI + cost
-const r=S.roi||{};const dc=(S.dreaming&&S.dreaming.cost)||{};
+const r=S.roi||{};const dc=(S.dreaming&&S.dreaming.cost)||{};const dcd=(S.dreaming&&S.dreaming.days)||7;
 card('ROI & Cost',
  `<div class="row"><span class="mut">Time saved (${r.window_days||'?'}d)</span><b>${r.time_saved_hours??'?'}h</b></div>
   <div class="row"><span class="mut">Value</span><b class="ok">${r.currency||'$'} ${r.value_of_time??'?'}</b></div>
   <div class="row"><span class="mut">Net ROI</span><b class="ok">${r.currency||'$'} ${r.net_roi??'?'} (${r.roi_multiple??'?'}x)</b></div>
-  <div class="row"><span class="mut">API-equiv cost (7d)</span><b>${dc.total_cost_usd!=null?'$'+dc.total_cost_usd:'?'}</b></div>
+  <div class="row"><span class="mut">API-equiv cost (${dcd}d)</span><b>${dc.total_cost_usd!=null?'$'+dc.total_cost_usd:'?'}</b></div>
   <div class="row"><span class="mut">Cache-hit</span><b>${dc.cache_hit_pct!=null?dc.cache_hit_pct+'%':'?'}</b></div>`);
 
 // Dreaming high-leverage
@@ -160,6 +201,88 @@ card('Health Trend',
  t.length?`<div class="spark">${t.map(x=>`<div style="height:${Math.max(3,(x.overall||0))}%" title="${x.date}: ${x.overall}"></div>`).join('')}</div>
   <div class="mut" style="margin-top:6px">${t.length} snapshots · latest ${t[t.length-1].overall}</div>`:'<div class="mut">No trend yet</div>');
 
+// Integrity guard — "broken ruler" detector; crit/high must be impossible to miss
+const ig=S.integrity||{};
+if(ig.counts){
+  const igc=ig.counts;
+  const igTotal=(igc.critical||0)+(igc.high||0)+(igc.medium||0)+(igc.low||0);
+  const igSev=(igc.critical||0)+(igc.high||0);
+  const igCls=igSev?'bad':(igTotal?'warn':'ok');
+  const igTop=(ig.violations||[]).filter(v=>v.severity==='critical'||v.severity==='high').slice(0,3);
+  card('🧮 Integrity',
+   `<div class="big ${igCls}">${igTotal}<span class="mut" style="font-size:14px"> violation${igTotal===1?'':'s'}</span></div>`+
+   `<div class="row"><span class="mut">critical / high</span><b class="${igSev?'bad':'ok'}">${igc.critical||0} / ${igc.high||0}</b></div>`+
+   `<div class="row"><span class="mut">medium / low</span><b>${igc.medium||0} / ${igc.low||0}</b></div>`+
+   (igTop.length?'<div style="margin-top:8px">'+igTop.map(v=>`<div class="mut" style="font-size:12px">⚠ ${v.check}: ${(v.detail||'').slice(0,90)}</div>`).join('')+'</div>'
+    :'<div class="ok" style="margin-top:8px">✓ no critical/high</div>'));
+} else { card('🧮 Integrity','<div class="mut">Run Integrity check to populate</div>'); }
+
+// A/B eval — did auto-applied rules actually reduce their target complaint rate?
+const ab=S.abeval||{};const absum=ab.summary||null;
+if(absum){
+  const eff=absum.effectiveness_pct;
+  card('🧪 A/B Eval (rules)',
+   `<div class="big ${eff==null?'mut':(eff>=50?'ok':'warn')}">${eff==null?'n/a':eff+'%'}<span class="mut" style="font-size:14px"> effective</span></div>`+
+   `<div class="row"><span class="mut">decided</span><b>${absum.decided||0} / ${absum.total_rules||0}</b></div>`+
+   `<div class="row"><span class="ok">effective</span><b class="ok">${absum.effective||0}</b></div>`+
+   `<div class="row"><span class="mut">no effect / regressed</span><b>${absum.no_effect||0} / <span class="${absum.regressed?'bad':'mut'}">${absum.regressed||0}</span></b></div>`+
+   `<div class="row"><span class="mut">pending / insuff.</span><b>${absum.pending||0} / ${absum.insufficient_data||0}</b></div>`+
+   `<div class="mut" style="font-size:11px;margin-top:8px">window ${ab.window_days||'?'}d · ITS — confounded, small-n</div>`);
+} else { card('🧪 A/B Eval (rules)','<div class="mut">Run A/B eval to populate</div>'); }
+
+// Outcome KPI — does the system actually LEARN? (results, not activity)
+const kp=S.kpi||{};const krc=kp.repeat_corrections||{};const kre=kp.recall_engagement||{};const kaf=kp.apply_funnel||{};
+if(kp.repeat_corrections||kp.apply_funnel){
+  const tr={improving:'📉 improving',degrading:'📈 DEGRADING',flat:'→ flat'}[kp.trend]||'· no data';
+  const rcRate=krc.rate;
+  card('📈 Outcome KPI',
+   `<div class="row"><span class="mut">Repeat corrections</span><b>${krc.repeats??'?'}/${krc.total??'?'}${rcRate!=null?' ('+Math.round(rcRate*100)+'%)':''}</b></div>`+
+   `<div class="row"><span class="mut">Trend</span><b>${tr}</b></div>`+
+   (kre.surfaced!=null?`<div class="row"><span class="mut">Recall usefulness</span><b>${kre.engaged??'?'}/${kre.surfaced} (${Math.round((kre.rate||0)*100)}%)</b></div>`:'')+
+   `<div class="row"><span class="mut">Applied (30d)</span><b>${kaf.applied_30d||0}</b></div>`+
+   `<div class="row"><span class="mut">Open incidents</span><b class="${kaf.open_incidents?'warn':'ok'}">${kaf.open_incidents||0}</b></div>`);
+} else { card('📈 Outcome KPI','<div class="mut">Run daily/weekly cycle to populate</div>'); }
+
+// Incidents — repeated user corrections are unresolved bugs (strongest pain signal)
+const esc=(s)=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const projShort=(p)=>(p||'?').replace('J--Antigraviti-','').replace('j--Antigraviti-','').replace('J--Obsidian-Resurch-','');
+const incd=(S.incidents&&S.incidents.open)||[];
+card('🚨 Incidents',
+ incd.length
+  ? `<div class="big bad">${incd.length}<span class="mut" style="font-size:14px"> open</span></div>`+
+    incd.slice(0,5).map(i=>`<div style="margin:8px 0 0"><div class="mut" style="font-size:12px">${esc(projShort(i.project))} ×${i.count||'?'} · since ${String(i.first_seen||'').slice(0,10)}</div><div style="font-size:13px">${esc((i.title||'').slice(0,70))}</div></div>`).join('')
+  : '<div class="ok">✓ no open incidents</div>', true);
+
+// Fix proposals — drafted, human-gated fix sessions (never auto-run)
+const fps=(S.fixproposals&&S.fixproposals.proposals)||[];
+const fpBy={};fps.forEach(p=>{const s=(p&&p.status)||'?';fpBy[s]=(fpBy[s]||0)+1;});
+const fpProposed=fps.filter(p=>p&&p.status==='proposed');
+card('🔧 Fix Proposals',
+ fps.length
+  ? `<div class="row"><span class="warn">proposed (awaiting review)</span><b class="${fpProposed.length?'warn':'mut'}">${fpBy.proposed||0}</b></div>`+
+    `<div class="row"><span class="mut">accepted / resolved</span><b>${fpBy.accepted||0} / ${fpBy.resolved||0}</b></div>`+
+    `<div class="row"><span class="mut">suppressed</span><b>${fpBy.suppressed||0}</b></div>`+
+    (fpProposed.length?'<div style="margin-top:8px">'+fpProposed.slice(0,4).map(p=>`<div style="font-size:12px;margin:4px 0"><span class="warn">→</span> ${esc(projShort(p.project))}: ${esc((p.title||'').slice(0,52))}</div>`).join('')+'</div>':'')+
+    `<div class="mut" style="font-size:11px;margin-top:8px">Review: python ~/.claude/scripts/incident_fix_proposer.py --list</div>`
+  : '<div class="mut">No fix proposals drafted</div>', true);
+
+// Gemini briefs — pending outbound task files
+const gb=S.gemini_briefs||{};const gbCount=gb.count||0;const gbRecent=gb.recent||[];
+card('📤 Gemini briefs',
+ gbCount
+  ? `<div class="big ${gbCount?'warn':'ok'}">${gbCount}<span class="mut" style="font-size:14px"> pending</span></div>`+
+    (gbRecent.length?'<div style="margin-top:8px">'+gbRecent.map(n=>`<div class="mut" style="font-size:12px">📄 ${esc(n)}</div>`).join('')+'</div>':'')+
+    `<div class="mut" style="font-size:11px;margin-top:8px">Send: python ~/.claude/scripts/gemini_dispatch.py &lt;file&gt; · or copy from ~/.claude/gemini-tasks/</div>`
+  : '<div class="ok">✓ no pending Gemini briefs</div>');
+
+// Research entity graphs
+const rs=S.research||{};const rsf=rs.files||[];
+card('🔬 Research Graphs',
+ rsf.length
+  ? `<div class="mut" style="margin-bottom:8px">${rsf.length} document${rsf.length===1?'':'s'} · <a href="/research" style="color:var(--ac)">view all</a></div>`+
+    rsf.slice(0,6).map(f=>`<div style="margin:5px 0"><a href="/research/${esc(f.slug)}" style="color:var(--ac);text-decoration:none">▸ ${esc(f.slug)}</a> <span class="mut">${f.n_entities} nodes · ${f.n_relations} edges</span></div>`).join('')
+  : `<div class="mut">No research documents yet — run <code>gemini_research.py</code> to create them.<br><br>Then use <a href="/research" style="color:var(--ac)">/research</a> to browse entity graphs.</div>`);
+
 // Domain registry (backbone)
 const reg=S.registry||{};const doms=reg.domains||{};const st=reg.stats||{};
 let regHtml=`<div class="mut" style="margin-bottom:8px">${st.skills||0} skills · ${st.commands||0} cmds · ${st.automations||0} autos · ${st.active_projects||0} projects</div>`;
@@ -170,6 +293,54 @@ for(const[d,data]of Object.entries(doms)){
    ${(data.skills||[]).map(s=>`<span class="pill">${s}</span>`).join('')}</div>`;
 }
 card('Domain Registry (backbone)',regHtml,true);
+
+// Skill Launcher — interactive, grouped by domain
+(function(){
+  const reg2=S.registry||{};const doms2=reg2.domains||{};
+  const domKeys=Object.keys(doms2);
+  if(!domKeys.length){
+    card('🚀 AGENTIC OS — Skill Launcher','<div class="mut">Run \'Refresh registry\' to populate</div>',true);
+    return;
+  }
+  // clipboard helper: tries navigator.clipboard, falls back to textarea execCommand
+  function copyText(text,btn){
+    function doFallback(){
+      try{
+        const ta=document.createElement('textarea');
+        ta.value=text;ta.style.cssText='position:fixed;opacity:0;top:0;left:0';
+        document.body.appendChild(ta);ta.focus();ta.select();
+        document.execCommand('copy');document.body.removeChild(ta);
+      }catch(e){console.warn('copy fallback failed',e);}
+    }
+    const orig=btn.textContent;
+    function confirm(){btn.textContent='✓ copied';btn.style.color='var(--ok)';setTimeout(()=>{btn.textContent=orig;btn.style.color='';},1400);}
+    if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+      navigator.clipboard.writeText(text).then(confirm,()=>{doFallback();confirm();});
+    } else { doFallback(); confirm(); }
+  }
+  let launcherHtml='<div style="font-size:11px;color:var(--mut);margin-bottom:10px">Click a skill/command to copy invocation → paste in Claude</div>';
+  for(const [dn,dd] of Object.entries(doms2)){
+    const skills=dd.skills||[];const cmds=dd.commands||[];
+    if(!skills.length&&!cmds.length)continue;
+    launcherHtml+=`<div class="dom" style="margin-bottom:10px">`;
+    launcherHtml+=`<b style="color:var(--ac);font-size:12px;text-transform:uppercase;letter-spacing:.5px">${esc(dn)}</b>`;
+    if((dd.projects||[]).length){launcherHtml+=`<span class="mut" style="font-size:11px;margin-left:6px">${esc(dd.projects.join(', '))}</span>`;}
+    launcherHtml+='<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px">';
+    for(const s of skills){
+      launcherHtml+=`<button class="sl-btn" data-copy="${esc('Use the '+s+' skill')}" title="Copy: Use the ${esc(s)} skill">${esc(s)}</button>`;
+    }
+    for(const c of cmds){
+      const raw=c.startsWith('/')?c:'/'+c;
+      launcherHtml+=`<button class="sl-btn" data-copy="${esc(raw)}" title="Copy: ${esc(raw)}" style="opacity:.85">/${esc(c.replace(/^\//,''))}</button>`;
+    }
+    launcherHtml+='</div></div>';
+  }
+  card('🚀 AGENTIC OS — Skill Launcher',launcherHtml,true);
+  // attach click handlers after card is in DOM
+  document.querySelectorAll('.sl-btn').forEach(b=>{
+    b.onclick=function(){copyText(b.dataset.copy,b);};
+  });
+})();
 
 // Automation candidates (the codify-next loop, from dreaming)
 const cand=(reg.automation_candidates||[]);
@@ -194,7 +365,8 @@ document.querySelectorAll('button[data-k]').forEach(b=>{
     if(!SERVE){out.textContent='Static mode — run in terminal:\n  python ~/.claude/scripts/'+
       ({daily:'automation_dispatcher.py daily',weekly:'automation_dispatcher.py weekly',dreaming:'automation_dispatcher.py dreaming',
         registry:'agentic_os_registry.py',roi:'roi_tracker.py --days 30',graphify:'auto_graphify.py',
-        health:'selfreg_monitor.py',freshness:'wiki_freshness_check.py --threshold 14'}[k]||k);return;}
+        health:'selfreg_monitor.py',freshness:'wiki_freshness_check.py --threshold 14',
+        integrity:'integrity_guard.py',abeval:'ab_eval.py'}[k]||k);return;}
     const orig=b.textContent;b.disabled=true;b.textContent='Running…';out.textContent='Running '+k+'…';
     try{const res=await fetch('/run?action='+encodeURIComponent(k),{method:'POST'});
       const txt=await res.text();out.textContent=txt;}
@@ -203,6 +375,333 @@ document.querySelectorAll('button[data-k]').forEach(b=>{
   };
 });
 </script></body></html>"""
+
+
+ENTITY_VIEWER_HTML = r"""<!DOCTYPE html>
+<html lang="bg"><head><meta charset="utf-8"><title>Entity Graph — __SLUG__</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--ok:#3fb950;--warn:#d29922;--ac:#58a6ff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;height:100vh;overflow:hidden}
+.sidebar{width:270px;min-width:270px;background:var(--card);border-right:1px solid var(--bd);display:flex;flex-direction:column;padding:16px;gap:10px;overflow-y:auto}
+.back{color:var(--ac);text-decoration:none;font-size:12px}.back:hover{text-decoration:underline}
+h2{font-size:15px;font-weight:700;word-break:break-all}
+.stats{color:var(--mut);font-size:12px}
+#search{background:#010409;border:1px solid var(--bd);color:var(--fg);border-radius:6px;padding:6px 10px;width:100%;font-size:13px;outline:none}
+#search:focus{border-color:var(--ac)}
+.tog-row{display:flex;gap:6px;flex-wrap:wrap}
+.tog{background:#21262d;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:5px 11px;cursor:pointer;font-size:12px}
+.tog.active{border-color:var(--ac);color:var(--ac)}
+.tog:hover{border-color:var(--ac)}
+#detail{background:#010409;border:1px solid var(--bd);border-radius:6px;padding:10px;font-size:12px;min-height:80px;flex:1}
+#detail h3{font-size:13px;margin-bottom:6px;color:var(--fg)}
+#detail .attr{color:var(--mut);margin:3px 0}
+#detail .attr b{color:var(--fg)}
+#detail .rels{margin-top:8px;font-size:11px}
+#detail .rel{color:var(--mut);margin:2px 0}
+.canvas-area{flex:1;position:relative;overflow:hidden}
+svg{width:100%;height:100%;display:block;cursor:grab}
+svg.panning{cursor:grabbing}
+.node-circle{stroke:#30363d;stroke-width:1.5;cursor:pointer;transition:stroke .15s}
+.node-circle:hover{stroke:var(--fg);stroke-width:2}
+.node-circle.selected{stroke:var(--fg);stroke-width:2.5}
+.node-circle.faded{opacity:.2}
+.node-label{pointer-events:none;fill:var(--fg);font-size:11px;text-anchor:middle;dominant-baseline:middle;user-select:none}
+.node-label.faded{opacity:.2}
+.edge-line{stroke-opacity:.55;stroke-width:1.5;marker-end:url(#arrow);cursor:pointer;transition:stroke-opacity .15s}
+.edge-line:hover{stroke-opacity:1}
+.edge-line.faded{stroke-opacity:.06}
+.edge-label{pointer-events:none;fill:var(--mut);font-size:10px;text-anchor:middle;dominant-baseline:middle}
+.edge-label.faded{opacity:.06}
+</style></head>
+<body>
+<div class="sidebar">
+  <a href="/" class="back">← Agentic OS</a>
+  <h2>__SLUG__</h2>
+  <div class="stats" id="stats"></div>
+  <input type="search" id="search" placeholder="Search entities…">
+  <div class="tog-row">
+    <button class="tog active" id="btnNodes">Labels</button>
+    <button class="tog active" id="btnEdges">Edges</button>
+    <button class="tog" id="btnReset">⟳ Reset</button>
+  </div>
+  <div id="detail"><div style="color:var(--mut);margin-top:4px">Click a node to see details</div></div>
+</div>
+<div class="canvas-area">
+<svg id="svg" xmlns="http://www.w3.org/2000/svg">
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+  <polygon points="0 0, 8 3, 0 6" fill="#58a6ff" fill-opacity=".7"/>
+</marker>
+</defs>
+<g id="root"><g id="edgesG"></g><g id="nodesG"></g></g>
+</svg>
+</div>
+<script>
+const DATA = __DATA__;
+const KIND_COLOR={person:'#7b8dff',org:'#ff9650',product:'#4ac94e',term:'#bf7fff',place:'#4acccf'};
+const DEFAULT_COLOR='#8b949e';
+
+const nodes=(DATA.entities||[]).map((e,i)=>({...e,id:i,color:KIND_COLOR[e.kind]||DEFAULT_COLOR,x:0,y:0,vx:0,vy:0,fixed:false}));
+const nodeIdx={};nodes.forEach(n=>nodeIdx[n.name]=n.id);
+const edges=(DATA.relations||[]).map((r,i)=>{
+  const si=nodeIdx[r.source],ti=nodeIdx[r.target];
+  return (si!=null&&ti!=null)?{...r,i,si,ti}:null;
+}).filter(Boolean);
+
+document.getElementById('stats').textContent=nodes.length+' entities · '+edges.length+' relations';
+
+const svg=document.getElementById('svg');
+const root=document.getElementById('root');
+const edgesG=document.getElementById('edgesG');
+const nodesG=document.getElementById('nodesG');
+
+let showLabels=true,showEdges=true;
+let selected=null,searchTerm='';
+let alpha=1,running=true;
+
+// SVG transform state
+let tx=0,ty=0,scale=1;
+function applyTransform(){root.setAttribute('transform',`translate(${tx},${ty}) scale(${scale})`);}
+
+// Build SVG elements
+const edgeEls=[],edgeLabelEls=[],nodeEls=[],nodeLabelEls=[];
+
+for(const e of edges){
+  const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+  line.classList.add('edge-line');line.setAttribute('stroke','#58a6ff');
+  edgesG.appendChild(line);edgeEls.push(line);
+  const lt=document.createElementNS('http://www.w3.org/2000/svg','text');
+  lt.classList.add('edge-label');lt.textContent=e.type||'';
+  edgesG.appendChild(lt);edgeLabelEls.push(lt);
+}
+
+for(const n of nodes){
+  const g=document.createElementNS('http://www.w3.org/2000/svg','g');
+  g.style.cursor='pointer';
+  const c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+  c.classList.add('node-circle');c.setAttribute('r','18');c.setAttribute('fill',n.color);
+  const lbl=document.createElementNS('http://www.w3.org/2000/svg','text');
+  lbl.classList.add('node-label');lbl.textContent=(n.name||'').slice(0,16);
+  g.appendChild(c);g.appendChild(lbl);
+  g.addEventListener('click',ev=>{ev.stopPropagation();selectNode(n);});
+  // drag
+  let dragging=false,ox=0,oy=0;
+  g.addEventListener('mousedown',ev=>{
+    if(ev.button!==0)return;
+    dragging=true;n.fixed=true;alpha=0.5;running=true;
+    const pt=svgPoint(ev);ox=pt.x-n.x;oy=pt.y-n.y;
+    ev.stopPropagation();ev.preventDefault();
+  });
+  window.addEventListener('mousemove',ev=>{
+    if(!dragging)return;
+    const pt=svgPoint(ev);n.x=pt.x-ox;n.y=pt.y-oy;drawFrame();
+  });
+  window.addEventListener('mouseup',()=>{if(dragging){dragging=false;n.fixed=false;}});
+  nodesG.appendChild(g);nodeEls.push(g);nodeLabelEls.push(lbl);
+}
+
+svg.addEventListener('click',()=>selectNode(null));
+
+function svgPoint(ev){
+  const r=svg.getBoundingClientRect();
+  return {x:(ev.clientX-r.left-tx)/scale,y:(ev.clientY-r.top-ty)/scale};
+}
+
+// Pan
+let panStart=null,txStart=0,tyStart=0;
+svg.addEventListener('mousedown',ev=>{
+  if(ev.target!==svg&&ev.target!==root)return;
+  panStart={x:ev.clientX,y:ev.clientY};txStart=tx;tyStart=ty;
+  svg.classList.add('panning');
+});
+window.addEventListener('mousemove',ev=>{
+  if(!panStart)return;
+  tx=txStart+(ev.clientX-panStart.x);ty=tyStart+(ev.clientY-panStart.y);applyTransform();
+});
+window.addEventListener('mouseup',()=>{panStart=null;svg.classList.remove('panning');});
+svg.addEventListener('wheel',ev=>{
+  ev.preventDefault();
+  const r=svg.getBoundingClientRect();const mx=ev.clientX-r.left,my=ev.clientY-r.top;
+  const factor=ev.deltaY<0?1.1:1/1.1;
+  tx=mx-(mx-tx)*factor;ty=my-(my-ty)*factor;scale*=factor;applyTransform();
+},{passive:false});
+
+// Force simulation
+function initPositions(){
+  const W=svg.clientWidth||800,H=svg.clientHeight||600;
+  const cx=W/2,cy=H/2;
+  tx=-cx*(scale-1)+0;ty=-cy*(scale-1)+0;
+  const r=Math.min(W,H)*0.28;
+  nodes.forEach((n,i)=>{
+    const a=(i/Math.max(nodes.length,1))*2*Math.PI;
+    n.x=cx+r*Math.cos(a);n.y=cy+r*Math.sin(a);n.vx=0;n.vy=0;
+  });
+  tx=0;ty=0;scale=1;applyTransform();
+}
+
+function tick(){
+  if(!running)return;
+  const W=svg.clientWidth||800,H=svg.clientHeight||600;
+  const cx=W/2,cy=H/2;
+  // Repulsion
+  for(let i=0;i<nodes.length;i++){
+    for(let j=i+1;j<nodes.length;j++){
+      const dx=nodes[i].x-nodes[j].x,dy=nodes[i].y-nodes[j].y;
+      const d2=Math.max(dx*dx+dy*dy,1);const d=Math.sqrt(d2);
+      const f=4000/(d2);const fx=f*dx/d,fy=f*dy/d;
+      if(!nodes[i].fixed){nodes[i].vx+=fx;nodes[i].vy+=fy;}
+      if(!nodes[j].fixed){nodes[j].vx-=fx;nodes[j].vy-=fy;}
+    }
+  }
+  // Spring
+  for(const e of edges){
+    const ni=nodes[e.si],nj=nodes[e.ti];
+    const dx=nj.x-ni.x,dy=nj.y-ni.y;const d=Math.sqrt(dx*dx+dy*dy)||1;
+    const rest=120;const f=(d-rest)*0.12;const fx=f*dx/d,fy=f*dy/d;
+    if(!ni.fixed){ni.vx+=fx;ni.vy+=fy;}
+    if(!nj.fixed){nj.vx-=fx;nj.vy-=fy;}
+  }
+  // Center gravity
+  for(const n of nodes){
+    if(n.fixed)continue;
+    n.vx+=(cx-n.x)*0.015*alpha;n.vy+=(cy-n.y)*0.015*alpha;
+  }
+  // Damping
+  for(const n of nodes){
+    if(n.fixed)continue;
+    n.vx*=0.78;n.vy*=0.78;n.x+=n.vx;n.y+=n.vy;
+  }
+  alpha*=0.975;
+  if(alpha<0.005&&nodes.every(n=>!n.fixed))running=false;
+}
+
+function drawFrame(){
+  for(let i=0;i<edges.length;i++){
+    const e=edges[i],ni=nodes[e.si],nj=nodes[e.ti];
+    const dx=nj.x-ni.x,dy=nj.y-ni.y,d=Math.sqrt(dx*dx+dy*dy)||1;
+    const r=18;const ex=nj.x-dx/d*r,ey=nj.y-dy/d*r;
+    const sx=ni.x+dx/d*r,sy=ni.y+dy/d*r;
+    edgeEls[i].setAttribute('x1',sx);edgeEls[i].setAttribute('y1',sy);
+    edgeEls[i].setAttribute('x2',ex);edgeEls[i].setAttribute('y2',ey);
+    edgeLabelEls[i].setAttribute('x',(sx+ex)/2);edgeLabelEls[i].setAttribute('y',(sy+ey)/2-6);
+  }
+  for(let i=0;i<nodes.length;i++){
+    const n=nodes[i];
+    nodeEls[i].setAttribute('transform',`translate(${n.x},${n.y})`);
+  }
+  applyVisibility();
+}
+
+function applyVisibility(){
+  const q=searchTerm.toLowerCase().trim();
+  const matchSet=new Set();
+  if(q){
+    nodes.forEach(n=>{if((n.name||'').toLowerCase().includes(q))matchSet.add(n.id);});
+    // also include neighbours
+    edges.forEach(e=>{if(matchSet.has(e.si))matchSet.add(e.ti);if(matchSet.has(e.ti))matchSet.add(e.si);});
+  }
+  for(let i=0;i<nodes.length;i++){
+    const n=nodes[i],sel=(selected&&selected.id===n.id);
+    const faded=q&&!matchSet.has(n.id);
+    const c=nodeEls[i].querySelector('circle');const lbl=nodeEls[i].querySelector('text');
+    c.classList.toggle('faded',faded);c.classList.toggle('selected',sel);
+    lbl.classList.toggle('faded',faded);lbl.style.display=showLabels?'':'none';
+  }
+  for(let i=0;i<edges.length;i++){
+    const e=edges[i];
+    const faded=q&&(!matchSet.has(e.si)||!matchSet.has(e.ti));
+    edgeEls[i].classList.toggle('faded',faded);
+    edgeEls[i].style.display=showEdges?'':'none';
+    edgeLabelEls[i].classList.toggle('faded',faded);
+    edgeLabelEls[i].style.display=(showEdges&&showLabels)?'':'none';
+  }
+}
+
+function selectNode(n){
+  selected=n;
+  const detail=document.getElementById('detail');
+  if(!n){detail.innerHTML='<div style="color:var(--mut);margin-top:4px">Click a node to see details</div>';applyVisibility();return;}
+  const rels=edges.filter(e=>e.si===n.id||e.ti===n.id);
+  const attrs=Object.entries(n).filter(([k])=>!['id','x','y','vx','vy','fixed','color'].includes(k));
+  detail.innerHTML=`<h3>${esc(n.name||'')}</h3>`+
+    attrs.map(([k,v])=>`<div class="attr"><b>${esc(k)}:</b> ${esc(String(v||''))}</div>`).join('')+
+    (rels.length?`<div class="rels"><div class="attr" style="margin-top:8px;font-weight:700">Relations (${rels.length}):</div>`+
+      rels.map(r=>{const other=r.si===n.id?nodes[r.ti]:nodes[r.si];const dir=r.si===n.id?'→':'←';
+        return `<div class="rel">${dir} <b>${esc(r.type||'')}</b> ${esc(other?other.name:'?')}</div>`;}).join('')+'</div>':'');
+  applyVisibility();
+}
+
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+// Controls
+document.getElementById('btnNodes').onclick=function(){showLabels=!showLabels;this.classList.toggle('active',showLabels);applyVisibility();};
+document.getElementById('btnEdges').onclick=function(){showEdges=!showEdges;this.classList.toggle('active',showEdges);applyVisibility();};
+document.getElementById('btnReset').onclick=()=>{initPositions();alpha=1;running=true;};
+document.getElementById('search').addEventListener('input',e=>{searchTerm=e.target.value;applyVisibility();});
+
+// Animation loop
+function loop(){tick();drawFrame();requestAnimationFrame(loop);}
+
+initPositions();
+drawFrame();
+loop();
+</script>
+</body></html>"""
+
+
+def render_entity_viewer(slug: str) -> str | None:
+    """Return HTML for the entity viewer for the given slug, or None if not found."""
+    p = RESEARCH_TRANSCRIPTS / f"{slug}.entities.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        data = {}
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/").replace("<!--", "<\\!--")
+    return (ENTITY_VIEWER_HTML
+            .replace("__SLUG__", slug)
+            .replace("__DATA__", payload))
+
+
+RESEARCH_LIST_HTML = r"""<!DOCTYPE html>
+<html lang="bg"><head><meta charset="utf-8"><title>Research — Agentic OS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#30363d;--fg:#e6edf3;--mut:#8b949e;--ac:#58a6ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;padding:32px}
+a{color:var(--ac);text-decoration:none}.back{font-size:12px}.back:hover{text-decoration:underline}
+h1{font-size:20px;margin:12px 0 4px}.sub{color:var(--mut);font-size:12px;margin-bottom:24px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;text-decoration:none;display:block;transition:border-color .15s}
+.card:hover{border-color:var(--ac)}.card h2{font-size:15px;color:var(--ac);margin-bottom:6px}
+.meta{color:var(--mut);font-size:12px}.empty{color:var(--mut);margin-top:32px}
+</style></head>
+<body>
+<a href="/" class="back">← Agentic OS</a>
+<h1>🔬 Research Entity Graphs</h1>
+<div class="sub">__BASE__</div>
+<div class="grid" id="grid">__CARDS__</div>
+</body></html>"""
+
+
+def render_research_list() -> str:
+    files = _find_entity_files()
+    if not files:
+        cards = '<div class="empty">No research documents yet.<br>Run: <code>python ~/.claude/scripts/gemini_research.py "..." --domain web</code></div>'
+    else:
+        cards = "".join(
+            f'<a class="card" href="/research/{f["slug"]}">'
+            f'<h2>{f["slug"]}</h2>'
+            f'<div class="meta">{f["n_entities"]} entities · {f["n_relations"]} relations</div>'
+            f'</a>'
+            for f in files
+        )
+    return (RESEARCH_LIST_HTML
+            .replace("__BASE__", str(RESEARCH_TRANSCRIPTS))
+            .replace("__CARDS__", cards))
 
 
 def render(serve: bool) -> str:
@@ -236,8 +735,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        if urlparse(self.path).path in ("/", "/index.html"):
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
             self._send(200, render(serve=True))
+        elif path == "/research":
+            self._send(200, render_research_list())
+        elif path.startswith("/research/"):
+            slug = path[len("/research/"):]
+            # Basic sanitization: alphanumeric + dash + underscore only
+            import re
+            if not re.match(r'^[\w\-]+$', slug):
+                self._send(400, "invalid slug")
+                return
+            html = render_entity_viewer(slug)
+            if html is None:
+                self._send(404, f"No entity file found for slug: {slug}")
+            else:
+                self._send(200, html)
         else:
             self._send(404, "not found")
 

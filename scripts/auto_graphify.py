@@ -223,10 +223,16 @@ def run(dry_run: bool, max_builds: int) -> dict:
     builds_done = 0
 
     for code_name, wiki_name in mapping.items():
-        status = (metadata.get(wiki_name, {}) or {}).get("status", "active")
+        meta_entry = metadata.get(wiki_name, {}) or {}
+        status = meta_entry.get("status", "active")
         if status != "active":
             continue
-        code_root = base_code / code_name
+        # Honor optional code_root override (e.g. Claude tooling workspace lives in
+        # {{HOME}}\.claude, not in {{CODE_PATH}}\Claude).
+        if "code_root" in meta_entry:
+            code_root = Path(meta_entry["code_root"])
+        else:
+            code_root = base_code / code_name
         if not code_root.is_dir():
             queued.append({"project": wiki_name, "reason": "code dir missing", "code": str(code_root)})
             continue
@@ -243,7 +249,7 @@ def run(dry_run: bool, max_builds: int) -> dict:
                 builds_done += 1
                 continue
             try:
-                stack_hint = (metadata.get(wiki_name, {}) or {}).get("stack", "")
+                stack_hint = meta_entry.get("stack", "")
                 graph = build_structural_graph(wiki_name, wiki_name, code_root, stack_hint)
                 graph_file.parent.mkdir(parents=True, exist_ok=True)
                 graph_file.write_text(json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8")

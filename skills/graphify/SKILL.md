@@ -22,6 +22,19 @@ python skills/graphify/scripts/init_graph.py "<ProjectName>" "<{{WIKI_PATH}}/Pro
 
 This creates placeholder files. Proceed to fill them in.
 
+## Step 1b — Audit Script Completeness (for script-collection projects)
+
+If the project is a collection of scripts (e.g. `scripts/*.py`), the graph must
+not silently omit files. Count them and record the number for the meta block:
+
+```bash
+ls scripts/ | grep '\.py$' | wc -l          # total .py files on disk
+```
+
+Every file on disk should land in *some* cluster (Step 3). Any file not placed
+in a cluster is invisible to every agent that trusts the graph as the map.
+Record the disk count — it becomes `meta.script_count` in Step 4.
+
 ## Step 2 — Discover Project Structure
 
 Read the entry point first (80% of architecture info lives here):
@@ -56,6 +69,12 @@ Each cluster = one `.md` file + one entry in `clusters{}` in the JSON.
 ## Step 4 — Fill knowledge_graph.json
 
 Use `references/graph-template.json` as the structure guide.
+
+**Add these self-auditing fields to `meta`** (so staleness is detectable —
+`integrity_guard.py` compares them against disk and FLAGS drift):
+- `script_count` — the integer from Step 1b (total `.py` files on disk).
+- `test_count` — from `python -m pytest tests/ --collect-only -q 2>&1 | grep "tests collected"` (use a hidden-window subprocess; set `null` if pytest is unavailable).
+- `graph_updated` — today's date.
 
 **critical_rules is the most valuable section** — add 5-15 rules that are:
 - Non-obvious (NOT derivable just by reading the code)
@@ -99,6 +118,20 @@ For each cluster, read only:
 
 Fill in: files list, endpoints, data model, critical rules specific to this cluster.
 
+## Step 5b — Clean Orphaned Cluster Files
+
+Run ONLY after the new `.md` files exist (Step 5) — never before, or a crash
+mid-write could delete files with no replacement. Delete `.md` files that no
+longer correspond to a current cluster (a renamed/removed cluster leaves a stale
+file that misleads agents into seeing clusters the JSON does not have):
+
+```powershell
+$graphDir = '{{WIKI_PATH}}\ProjectName\graph'
+$keys = (Get-Content "$graphDir\knowledge_graph.json" -Raw | ConvertFrom-Json).clusters.PSObject.Properties.Name
+$keep = $keys + @('index','shared-patterns','cross_project')
+Get-ChildItem $graphDir -Filter '*.md' | Where-Object { $_.BaseName -notin $keep } | Remove-Item -Confirm:$false
+```
+
 ## Step 6 — Update CLAUDE.md
 
 Add (or update) this section in the project's CLAUDE.md:
@@ -120,11 +153,33 @@ Fill `graph/shared-patterns.md` with which cross-project patterns apply:
 
 ## Output Checklist
 
-- [ ] `knowledge_graph.json` — meta, architecture, critical_rules (5-15), clusters
+- [ ] `knowledge_graph.json` — meta (incl. script_count + test_count), architecture, critical_rules (5-15), clusters
 - [ ] `index.md` — navigation table with all clusters
 - [ ] One `.md` per cluster — files, endpoints, data model, rules
 - [ ] `shared-patterns.md` — applicable cross-project patterns
 - [ ] Project `CLAUDE.md` — Knowledge Graph RAG section added
+- [ ] Step 7b post-write verification run — printed counts match intent
+
+## Step 7b — Post-Write Verification (MANDATORY before reporting done)
+
+After writing `knowledge_graph.json`, READ IT BACK FROM DISK and compare the
+actual counts against what you intended. This guards against the failure mode
+where an agent reports "updated to N clusters / M rules" while the file on disk
+holds different values (the graph generated in memory but never persisted, or a
+later regen clobbered a manual edit).
+
+```python
+import json
+d = json.load(open(r"{{WIKI_PATH}}\ProjectName\graph\knowledge_graph.json", encoding="utf-8"))
+print("clusters:", len(d["clusters"]),
+      "| critical_rules:", len(d["critical_rules"]),
+      "| script_count:", d["meta"].get("script_count"),
+      "| test_count:", d["meta"].get("test_count"))
+```
+
+Only declare done when the printed numbers match what you intended to write. If
+they differ, the write failed or was overwritten — re-write and re-verify. Never
+report counts from memory; report only what this read-back prints.
 
 ## Token Budget
 

@@ -17,10 +17,21 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# Semantic gate: never scaffold a draft for a pure tool-ngram routine
+# (e.g. "write-cat", "edit-powershell") — these have no reusable value and
+# were the source of the ~480-junk-drafts-per-cycle explosion.
+try:  # pragma: no cover - llm_judge is always present in practice
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from llm_judge import is_tool_ngram as _is_tool_ngram
+except Exception:  # pragma: no cover
+    def _is_tool_ngram(_name: str) -> bool:  # type: ignore
+        return False
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -234,8 +245,23 @@ def write_skill_drafts(
         if not slug:
             continue
 
+        # Generation gate: pure tool-ngram routines have no reusable value.
+        if _is_tool_ngram(slug):
+            continue
+
         dest_dir = out_dir / slug
         dest_file = dest_dir / "SKILL.md"
+
+        # Convergence guard: if this slug was already pruned as junk (lives in
+        # the sibling -rejected dir) do NOT re-emit it — otherwise every
+        # dreaming cycle regenerates the same drafts the judge just pruned.
+        rejected_dir = out_dir.parent / (out_dir.name + "-rejected")
+        if (rejected_dir / slug).exists():
+            continue
+        # Idempotency: already scaffolded — don't rewrite on every run.
+        if dest_file.exists():
+            written.append(dest_file)
+            continue
 
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
@@ -367,6 +393,14 @@ def process_accepted_habits(
         if not slug:
             continue
 
+        # Generation gate: never scaffold a pure tool-ngram routine.
+        if _is_tool_ngram(slug):
+            print(
+                f"[habit_to_skill] skipping '{item_id}' — tool-ngram slug '{slug}' has no reusable value",
+                file=sys.stderr,
+            )
+            continue
+
         dest_dir = out_dir / slug
         dest_file = dest_dir / "SKILL.md"
 
@@ -385,6 +419,9 @@ def process_accepted_habits(
             dest_file.write_text(content, encoding="utf-8")
             written.append(dest_file)
             print(f"[habit_to_skill] scaffolded '{item_id}' -> {dest_file}", file=sys.stderr)
+            # GC: accepted items are installed by the caller — remove the
+            # draft dir so it doesn't linger in skill-drafts/ forever.
+            shutil.rmtree(dest_dir, ignore_errors=True)
         except Exception as exc:
             print(
                 f"[habit_to_skill] warning: could not write {dest_file}: {exc}",
@@ -587,6 +624,10 @@ def auto_apply_habits(
 
         installed.append(dest)
         print(f"[habit_to_skill] auto-applied skill '{slug}' (tier={tier}) -> {dest}", file=sys.stderr)
+        # GC: the draft is now a real skill — remove the source draft dir so it
+        # doesn't linger in skill-drafts/ forever. Ledger dedup (is_in_ledger)
+        # prevents re-install even though the source is gone.
+        shutil.rmtree(draft_dir, ignore_errors=True)
 
     return installed
 

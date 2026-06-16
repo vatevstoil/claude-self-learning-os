@@ -13,6 +13,7 @@ Schema (from local_rag.py):
 All tests use in-memory or tmp_path sqlite — NEVER touch the real DB.
 """
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone, timedelta
@@ -24,6 +25,21 @@ sys.path.insert(0, str(Path.home() / ".claude" / "scripts"))
 
 # Reference datetime: 2026-06-10 UTC (today per task context)
 NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _make_today_backup(backup_dir: Path) -> Path:
+    """Create a fake backup whose mtime matches the injected NOW.
+
+    _today_backup_exists() compares the file's mtime DATE against now.date().
+    A freshly written file carries the REAL clock's date, so tests written
+    with a pinned NOW silently break the day after they are authored unless
+    the mtime is pinned too (latent failure caught 2026-06-11).
+    """
+    p = backup_dir / "local_rag-daily.db"
+    p.write_bytes(b"fake backup")
+    ts = NOW.timestamp()
+    os.utime(p, (ts, ts))
+    return p
 
 # ---------------------------------------------------------------------------
 # Test DB helpers — replicate exact local_rag.py schema
@@ -250,12 +266,10 @@ def test_archive_apply_with_backup_moves_rows(tmp_path):
     tracker = tmp_path / "tracker.json"
     _make_tracker(tracker, [])  # nothing recalled
 
-    # Create a fake today backup
+    # Create a fake backup dated to the injected NOW (mtime pinned)
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
-    backup_file = backup_dir / "local_rag-daily.db"
-    # Write it with today's mtime (just create it — mtime will be now)
-    backup_file.write_bytes(b"fake backup")
+    _make_today_backup(backup_dir)
 
     original_backup_dir = ma.BACKUP_DIR
     ma.BACKUP_DIR = backup_dir
@@ -297,7 +311,7 @@ def test_archive_apply_protected_types_never_archived(tmp_path):
 
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
-    (backup_dir / "local_rag-daily.db").write_bytes(b"backup")
+    _make_today_backup(backup_dir)
 
     original = ma.BACKUP_DIR
     ma.BACKUP_DIR = backup_dir
@@ -339,7 +353,7 @@ def test_restore_moves_back(tmp_path):
 
     backup_dir = tmp_path / "backups"
     backup_dir.mkdir()
-    (backup_dir / "local_rag-daily.db").write_bytes(b"backup")
+    _make_today_backup(backup_dir)
 
     original = ma.BACKUP_DIR
     ma.BACKUP_DIR = backup_dir

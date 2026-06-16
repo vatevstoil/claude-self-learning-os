@@ -57,6 +57,11 @@ def _save_state(state: dict) -> None:
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Hook payload is UTF-8 JSON; Windows piped stdin defaults to cp1251.
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:

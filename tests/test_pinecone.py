@@ -19,9 +19,17 @@ def test_pinecone_error_is_exception_not_baseexception():
 
 def test_req_raises_pinecone_error_on_network_failure(monkeypatch):
     import pinecone
-    # Point at an unresolvable host so urlopen raises URLError.
+    from urllib.error import URLError
+    # Mock the transport so NO real socket is opened — the original used a real
+    # request to an unresolvable host, which depended on DNS/connect behaviour
+    # and could stall the suite (a hostname relied on DNS; a loopback IP made
+    # Windows wait out the connect for ~18s). We test only that a transport
+    # failure is wrapped as PineconeError (an Exception), never SystemExit.
+    def boom(*a, **k):
+        raise URLError("mocked network failure")
+    monkeypatch.setattr(pinecone, "urlopen", boom)
     try:
-        pinecone._req("https://this-host-does-not-exist.invalid/foo")
+        pinecone._req("http://example.test/foo")
         assert False, "expected PineconeError"
     except pinecone.PineconeError:
         pass  # correct
@@ -31,6 +39,12 @@ def test_req_raises_pinecone_error_on_network_failure(monkeypatch):
 
 def test_query_and_track_returns_empty_list_on_error(monkeypatch):
     import pinecone
+    # Pin the hosted backend: with MEMORY_BACKEND=local (the default) the
+    # function delegates to local_rag → a REAL Ollama embed call, which made
+    # this test silently network-dependent (fast Ollama = "pass", busy
+    # Ollama = suite hang caught 2026-06-11). The embed mock below is only
+    # on the pinecone path.
+    monkeypatch.setattr(pinecone, "MEMORY_BACKEND", "pinecone")
     # Force embed() to fail with a network error mid-flow.
     def boom(*a, **k):
         raise pinecone.PineconeError("simulated network failure")
@@ -41,6 +55,7 @@ def test_query_and_track_returns_empty_list_on_error(monkeypatch):
 
 def test_query_and_track_does_not_propagate_systemexit(monkeypatch):
     import pinecone
+    monkeypatch.setattr(pinecone, "MEMORY_BACKEND", "pinecone")
     # Even if something raises SystemExit internally, query_and_track's
     # contract is "never crash the caller". (SystemExit is BaseException,
     # so this documents that the wrapper's except Exception will NOT catch
@@ -49,4 +64,19 @@ def test_query_and_track_does_not_propagate_systemexit(monkeypatch):
         raise pinecone.PineconeError("net down")
     monkeypatch.setattr(pinecone, "embed", real_embed_path)
     # Should return [] cleanly, not raise.
+    assert pinecone.query_and_track("ns", "q") == []
+
+
+def test_query_and_track_local_backend_failure_returns_empty(monkeypatch):
+    """The never-raise contract must hold on the LOCAL path too — stubbed,
+    so no real Ollama/sqlite is touched."""
+    import pinecone
+
+    class _BoomLocal:
+        @staticmethod
+        def query(*a, **k):
+            raise RuntimeError("local backend down")
+
+    monkeypatch.setattr(pinecone, "MEMORY_BACKEND", "local")
+    monkeypatch.setattr(pinecone, "_local", lambda: _BoomLocal)
     assert pinecone.query_and_track("ns", "q") == []

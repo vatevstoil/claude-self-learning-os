@@ -30,6 +30,262 @@ _DEFAULT_CANDIDATES = Path.home() / ".claude" / "logs" / "boris-candidates.json"
 _DEFAULT_OUT_DIR = Path.home() / ".claude" / "logs" / "boris-drafts"
 
 # ---------------------------------------------------------------------------
+# Correction detector — filters out questions, system noise, and directives
+# ---------------------------------------------------------------------------
+
+# System noise prefixes — messages starting with these are never corrections.
+# Kept in sync with incident_tracker._SYSTEM_NOISE_PREFIX.
+_NOISE_PREFIXES: tuple[str, ...] = (
+    "stop hook feedback",
+    "<system-reminder>",
+)
+
+# Pure question starters (Bulgarian interrogatives without explicit negation).
+# A message starting with these AND lacking a negation/error word is a question,
+# not a correction. Checked case-insensitively after stripping leading whitespace.
+_QUESTION_STARTERS: tuple[str, ...] = (
+    "може ли",
+    "дали ",
+    "защо ",
+    "какво ",
+    "как ",
+    "кой ",
+    "кога ",
+    "колко ",
+    "къде ",
+    "what ",
+    "why ",
+    "how ",
+    "when ",
+    "where ",
+    "can ",
+    "could ",
+    "would ",
+    "should ",
+    "is ",
+    "are ",
+    "do ",
+    "does ",
+)
+
+# Negation / error words: presence of ANY of these in the message makes it a
+# correction even if it has a question starter or question mark.
+_NEGATION_WORDS: frozenset[str] = frozenset({
+    "не работи", "неработи", "не стартира", "не се отчете", "не показва",
+    "не зарежда", "не се виждат", "не се вижда", "не дава",
+    "не е ок", "не е вярно", "не е нормален", "не е нормално",
+    "грешка", "проблем", "error", "bug", "не прави", "нищо не",
+    "отново не", "пак не", "пак се", "отново се",
+})
+
+
+def _dedup_tokens(text: str) -> str:
+    """Collapse runs of 3+ consecutive identical tokens (e.g. 'стоп стоп стоп').
+
+    Consecutive duplicates beyond 2 repetitions are stripped.  This prevents
+    frustrated user repetition from inflating token count and skewing the rule.
+
+    Args:
+        text: Raw message text.
+
+    Returns:
+        Text with triple-or-more consecutive token repetitions collapsed to 2.
+    """
+    tokens = text.split()
+    if len(tokens) < 3:
+        return text
+
+    result: list[str] = []
+    for tok in tokens:
+        # Keep at most 2 consecutive identical tokens
+        if len(result) >= 2 and result[-1] == tok and result[-2] == tok:
+            continue
+        result.append(tok)
+    return " ".join(result)
+
+
+def is_correction(message: str) -> bool:
+    """Return True if *message* looks like a genuine user correction.
+
+    Filters out:
+    - System noise (Stop hook feedback, <system-reminder> blocks)
+    - Pure questions (ending with '?' and no negation/error word)
+    - Pure question starters without negation context
+    - Empty / whitespace-only messages
+
+    Args:
+        message: Raw candidate message text.
+
+    Returns:
+        True if the message is a genuine correction that warrants a Boris rule.
+    """
+    if not message or not message.strip():
+        return False
+
+    text = message.strip()
+    lower = text.lower()
+
+    # 1. System noise — hard exclude
+    for prefix in _NOISE_PREFIXES:
+        if lower.startswith(prefix):
+            return False
+
+    # 2. Ends with '?' — candidate for question; may still be complaint
+    ends_with_question = text.endswith("?")
+
+    # 3. Check for negation/error words — these override question heuristics
+    has_negation = any(neg in lower for neg in _NEGATION_WORDS)
+
+    if ends_with_question and not has_negation:
+        # Pure question — not a correction
+        return False
+
+    # 4. Starts with interrogative starter AND lacks negation → question
+    for starter in _QUESTION_STARTERS:
+        if lower.startswith(starter) and not has_negation:
+            return False
+
+    return True
+
+
+def filter_corrections(examples: list[str]) -> list[str]:
+    """Filter and de-duplicate a list of candidate messages.
+
+    Applies is_correction() and token deduplication.  Preserves order.
+
+    Args:
+        examples: Raw candidate message list.
+
+    Returns:
+        Filtered list of genuine corrections (may be shorter than input).
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in examples:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        deduped = _dedup_tokens(raw.strip())
+        if not is_correction(deduped):
+            continue
+        if deduped not in seen:
+            seen.add(deduped)
+            result.append(deduped)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# LLM rule synthesis
+# ---------------------------------------------------------------------------
+
+_RULE_SYNTHESIS_SYSTEM_PROMPT = (
+    "You are a rule-synthesis assistant for an AI coding assistant's CLAUDE.md config. "
+    "The user will give you 1-5 examples of corrections a human made to the AI's behaviour. "
+    "Your job: synthesise ONE imperative rule in Bulgarian (max 140 characters) that an AI "
+    "assistant should follow to avoid repeating the mistake. "
+    "Requirements: "
+    "(1) Output ONLY the rule text — no explanation, no markdown, no quotes. "
+    "(2) The rule must be actionable and specific (not a restatement of the examples). "
+    "(3) Start with an imperative verb (e.g. 'Винаги...', 'Не...', 'Преди...'). "
+    "(4) Max 140 characters. "
+    "If the examples are too vague to produce a specific rule, output exactly: "
+    "NEEDS HUMAN REWRITE"
+)
+
+_RULE_MAX_CHARS = 140
+
+
+def synthesize_rule_with_llm(
+    examples: list[str],
+    judge_text_fn=None,  # type: ignore[type-arg]
+) -> str:
+    """Call LLM to synthesize a single imperative rule from correction examples.
+
+    Uses llm_judge.judge_text as the LLM transport.  If the LLM is unavailable
+    or returns a bad result, falls back to a safe "NEEDS HUMAN REWRITE: <hint>"
+    marker so that auto_apply_boris writes a human-readable placeholder instead
+    of verbatim junk.
+
+    Args:
+        examples: Filtered correction examples to synthesize from.
+        judge_text_fn: Injectable judge_text callable (for testing without
+            network). If None, imports from llm_judge at call time.
+
+    Returns:
+        Rule string (<=140 chars) or "NEEDS HUMAN REWRITE: <hint>" fallback.
+    """
+    if judge_text_fn is None:
+        try:
+            from llm_judge import judge_text as _judge_text
+            judge_text_fn = _judge_text
+        except ImportError:
+            judge_text_fn = None
+
+    # Build fallback hint (short summary from longest example)
+    hint_text = max(examples, key=lambda x: len(x)) if examples else "no examples"
+    hint = hint_text[:60].rsplit(" ", 1)[0] if len(hint_text) > 60 else hint_text
+    fallback = f"NEEDS HUMAN REWRITE: {hint}"
+
+    # No point calling LLM with zero examples
+    if not examples:
+        return fallback
+
+    if judge_text_fn is None:
+        return fallback
+
+    user_text = "Correction examples:\n" + "\n".join(f"- {ex}" for ex in examples[:5])
+
+    try:
+        result = judge_text_fn(
+            system_prompt=_RULE_SYNTHESIS_SYSTEM_PROMPT,
+            user_text=user_text,
+        )
+    except Exception:
+        return fallback
+
+    if result is None:
+        # LLM unavailable
+        return fallback
+
+    # judge_text returns {"verdict", "score", "reason"} — for rule synthesis
+    # we abuse the "reason" field to carry the rule text, since the system
+    # prompt instructs the LLM to output only the rule.
+    # However, some LLMs may put the rule in "verdict" or return raw text in
+    # "reason". We handle both: if verdict is the raw rule (not "useful"/"junk"),
+    # use it; otherwise fall back to "reason".
+    verdict = result.get("verdict", "")
+    reason = result.get("reason", "")
+
+    # Pick whichever field looks like an actual rule (not a judge verdict label)
+    raw_rule = ""
+    if verdict not in ("useful", "junk", ""):
+        raw_rule = verdict
+    elif reason and len(reason) > 5:
+        raw_rule = reason
+
+    if not raw_rule:
+        return fallback
+
+    # Validate: must not be echo of examples verbatim, must be <=140 chars
+    rule = raw_rule.strip()
+    if len(rule) > _RULE_MAX_CHARS:
+        rule = rule[:_RULE_MAX_CHARS].rsplit(" ", 1)[0]
+
+    # Reject if it's just "NEEDS HUMAN REWRITE" from LLM (passthrough)
+    if rule.upper().startswith("NEEDS HUMAN REWRITE"):
+        return fallback
+
+    # Reject if rule is verbatim copy of one of the examples (LLM just echoed)
+    if any(rule.strip() == ex.strip() for ex in examples):
+        return fallback
+
+    # Sanity: non-empty after trimming
+    if not rule:
+        return fallback
+
+    return rule
+
+
+# ---------------------------------------------------------------------------
 # Negation prefixes to strip when building a rule hint (Bulgarian + English)
 # ---------------------------------------------------------------------------
 
@@ -62,6 +318,10 @@ def summarize_corrections(examples: list[str]) -> str:
     words, and returns a lowercased imperative hint.  The result is a
     best-effort heuristic -- not a perfect rule -- so the human reviewer can
     edit it before approving.
+
+    Note: This function operates on pre-filtered examples (use
+    filter_corrections() upstream).  It does NOT call the LLM — that is done
+    in generate_draft() with synthesize_rule_with_llm().
 
     Args:
         examples: List of raw correction strings from boris-candidates.json.
@@ -197,37 +457,57 @@ def _safe_filename(project_key: str) -> str:
     return safe
 
 
-def generate_draft(project: str, info: dict) -> str:  # type: ignore[type-arg]
+def generate_draft(
+    project: str,
+    info: dict,  # type: ignore[type-arg]
+    judge_text_fn=None,  # type: ignore[type-arg]
+) -> str:
     """Return a markdown draft string for a single project.
 
     The draft contains:
     - Project name
-    - Proposed rule line (generated by summarize_corrections)
-    - Verbatim evidence (all examples)
+    - Proposed rule (LLM-synthesized from filtered corrections, or safe fallback)
+    - Verbatim evidence (all examples, including filtered-out ones for audit)
     - Target CLAUDE.md path hint
 
-    This output is for human review only.  The tool never writes to any
-    CLAUDE.md automatically.
+    The "Proposed Rule" fenced code block is what --auto-apply reads and writes
+    into CLAUDE.md.  It will contain either a proper imperative rule (<=140 chars)
+    or "NEEDS HUMAN REWRITE: <hint>" — never verbatim junk from the examples.
 
     Args:
         project: Project key (as stored in boris-candidates.json).
         info: Dict with keys ``count`` (int) and ``examples`` (list[str]).
+        judge_text_fn: Injectable LLM callable for testing (default: auto-import).
 
     Returns:
         A markdown string ready to save as a draft file.
     """
     raw_examples = info.get("examples") or []
     # Tolerate null / non-string elements in examples
-    examples: list[str] = [str(e) for e in raw_examples if e is not None and str(e).strip()]
+    all_examples: list[str] = [str(e) for e in raw_examples if e is not None and str(e).strip()]
     try:
-        count: int = int(info.get("count", len(examples)))
+        count: int = int(info.get("count", len(all_examples)))
     except (TypeError, ValueError):
-        count = len(examples)
-    rule_hint = summarize_corrections(examples)
+        count = len(all_examples)
+
+    # Filter to genuine corrections before synthesis
+    genuine = filter_corrections(all_examples)
+
+    # LLM synthesizes the rule from filtered corrections; falls back to safe marker
+    if genuine:
+        rule_hint = synthesize_rule_with_llm(genuine, judge_text_fn=judge_text_fn)
+    else:
+        # No genuine corrections after filtering — still produce draft for audit
+        rule_hint = "NEEDS HUMAN REWRITE: no genuine corrections detected after filtering"
+
     path_hint = _encode_to_path_hint(project)
     target_path = f"{path_hint}\\CLAUDE.md"
 
-    evidence_lines = "\n".join(f"- {ex}" for ex in examples)
+    evidence_lines = "\n".join(f"- {ex}" for ex in all_examples)
+    filtered_note = (
+        f"\n_(Filtered to {len(genuine)}/{len(all_examples)} genuine corrections before synthesis.)_\n"
+        if len(genuine) != len(all_examples) else ""
+    )
 
     draft = f"""\
 # Boris Draft -- {project}
@@ -250,7 +530,7 @@ _(If the path looks wrong due to key encoding, adjust manually.)_
 ## Evidence
 
 Correction count in window: **{count}**
-
+{filtered_note}
 Examples (verbatim):
 
 {evidence_lines}
@@ -268,6 +548,7 @@ def write_drafts(
     boris_path: Path,
     out_dir: Path,
     min_count: int = 4,
+    judge_text_fn=None,
 ) -> list[Path]:
     """Write draft files for all projects meeting the count threshold.
 
@@ -275,6 +556,9 @@ def write_drafts(
         boris_path: Path to boris-candidates.json.
         out_dir: Directory to write ``{project}.md`` drafts into.
         min_count: Minimum correction count to generate a draft (inclusive).
+        judge_text_fn: Injectable LLM transport, forwarded to generate_draft.
+            Default None → generate_draft auto-imports the real llm_judge. Tests
+            inject a stub so they never touch the network.
 
     Returns:
         List of Paths that were actually written.  Empty list on any error
@@ -313,7 +597,7 @@ def write_drafts(
         return []
 
     for project_key, info in qualifying.items():
-        content = generate_draft(project_key, info)
+        content = generate_draft(project_key, info, judge_text_fn=judge_text_fn)
         safe_name = _safe_filename(project_key)
         dest = out_dir / f"{safe_name}.md"
         try:
@@ -580,6 +864,15 @@ def auto_apply_boris(
 
         rule_text = _extract_proposed_rule(draft_text)
         if not rule_text:
+            continue
+
+        # Never auto-write an un-synthesized placeholder into CLAUDE.md. When the
+        # LLM was unavailable (or examples too vague) the rule is a "NEEDS HUMAN
+        # REWRITE" marker — that must stay a draft for a human, not become a live
+        # rule. Tier-1 auto-apply only writes genuine synthesized rules.
+        if rule_text.strip().upper().startswith("NEEDS HUMAN REWRITE"):
+            log.info("auto_apply_boris: skipping %s — rule is a NEEDS-HUMAN-REWRITE placeholder",
+                     project_key)
             continue
 
         # Resolve target CLAUDE.md

@@ -46,6 +46,7 @@ class ProjectReport:
         self.graph_exists: bool = False
         self.graph_age_days: Optional[int] = None
         self.graph_source: str = ""   # "meta", "mtime", "missing"
+        self.graph_hollow: bool = False  # structural-only / no critical_rules
         self.log_exists: bool = False
         self.log_age_days: Optional[int] = None
         self.log_source: str = ""     # "header", "mtime", "missing"
@@ -57,6 +58,8 @@ class ProjectReport:
             return STATUS_OK
         if not self.graph_exists:
             return STATUS_MISS
+        if self.graph_hollow:
+            return STATUS_WARN  # exists but carries no enriched knowledge
         if self.graph_age_days is not None and self.graph_age_days > threshold:
             return STATUS_WARN
         if self.log_age_days is not None and self.log_age_days > threshold:
@@ -69,17 +72,45 @@ class ProjectReport:
             return False
         return self.flag(threshold) != STATUS_OK
 
-    def to_dict(self) -> dict:
-        return {
+    def staleness_kind(self, threshold: int) -> Optional[str]:
+        """Distinguish the root cause of staleness for actionable recommendations.
+
+        Returns one of:
+          "stale_graph"  — graph content date is old (needs /graphify)
+          "dead_log"     — log hasn't been updated (needs a log entry)
+          "missing_graph"— graph file absent entirely
+          None           — not stale / dormant / missing-wiki
+        """
+        if self.status in ("dormant", "missing-wiki"):
+            return None
+        if not self.graph_exists:
+            return "missing_graph"
+        if self.graph_hollow:
+            return "hollow_graph"  # needs first-time LLM enrichment, not a re-run
+        if self.graph_age_days is not None and self.graph_age_days > threshold:
+            return "stale_graph"
+        if self.log_age_days is not None and self.log_age_days > threshold:
+            return "dead_log"
+        return None
+
+    def to_dict(self, threshold: int = 14) -> dict:  # type: ignore[override]
+        base = {
             "project": self.name,
             "status": self.status,
             "graph_exists": self.graph_exists,
             "graph_age_days": self.graph_age_days,
             "graph_source": self.graph_source,
+            "graph_hollow": self.graph_hollow,
             "log_exists": self.log_exists,
             "log_age_days": self.log_age_days,
             "log_source": self.log_source,
         }
+        # Extra field: staleness kind for actionable recommendations.
+        # Added as an optional append so existing consumers ignore it safely.
+        kind = self.staleness_kind(threshold)
+        if kind is not None:
+            base["staleness_kind"] = kind
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -124,29 +155,70 @@ def _parse_iso(text: str) -> Optional[date]:
     return None
 
 
-def check_graph(wiki_root: Path) -> tuple[bool, Optional[int], str]:
-    """Return (exists, age_days, source) for knowledge_graph.json."""
+def check_graph(wiki_root: Path) -> tuple[bool, Optional[int], str, bool]:
+    """Return (exists, age_days, source, is_hollow) for knowledge_graph.json.
+
+    ``is_hollow`` is True for a structural-only graph (graph_source ==
+    "auto_graphify_structural") or one with zero critical_rules — it exists but
+    carries no LLM-enriched knowledge, so an agent must NOT trust it as the map.
+    A hollow graph needs first-time enrichment, not a staleness re-run.
+
+    Bug fixed: the old implementation used the first successfully-parsed date
+    field ("last_updated" then "generated") and stopped.  If last_updated was
+    older than generated (or mtime), the graph was reported as staler than it
+    really was (CasinoScore: last_updated=2026-05-21 vs generated=2026-06-04
+    → reported 20d stale instead of 6d).
+
+    Fix: collect all candidate dates (all string meta fields + file mtime),
+    clamp future dates to today, then return the *most recent* (min age).
+    The source string lists the winning field so downstream callers can still
+    distinguish "meta" from "mtime".
+    """
     graph_file = wiki_root / "graph" / "knowledge_graph.json"
     if not graph_file.exists():
-        return False, None, "missing"
+        return False, None, "missing", False
 
-    # Try meta.last_updated, then meta.generated, then file mtime
+    today = date.today()
+    candidates: list[tuple[date, str]] = []  # (date, source_label)
+    is_hollow = False
+
+    # --- meta date fields (all string values, not just two) -----------------
+    _META_DATE_FIELDS = (
+        "last_updated", "generated", "graph_updated", "updated", "date",
+    )
     try:
         data = json.loads(graph_file.read_text(encoding="utf-8", errors="replace"))
-        meta: dict = data.get("meta", {})
-
-        for field in ("last_updated", "generated"):
+        meta: dict = data.get("meta", {}) or {}
+        # Hollow = structural-only or no enriched critical_rules.
+        src_label = data.get("graph_source") or meta.get("graph_source") or ""
+        is_hollow = (src_label == "auto_graphify_structural"
+                     or not data.get("critical_rules"))
+        for field in _META_DATE_FIELDS:
             val = meta.get(field)
             if val and isinstance(val, str):
                 parsed = _parse_iso(val)
                 if parsed:
-                    return True, _days_ago(parsed), field
+                    # Clamp future dates to today (deadlines / planned dates
+                    # must not make the graph look "newer than now").
+                    clamped = min(parsed, today)
+                    candidates.append((clamped, field))
     except (json.JSONDecodeError, OSError):
         pass
 
-    # Fallback: file mtime
-    age = _days_ago(_mtime_date(graph_file))
-    return True, age, "mtime"
+    # --- file mtime (always available if the file exists) -------------------
+    try:
+        mtime = _mtime_date(graph_file)
+        clamped_mtime = min(mtime, today)
+        candidates.append((clamped_mtime, "mtime"))
+    except OSError:
+        pass
+
+    if not candidates:
+        return True, None, "unknown", is_hollow
+
+    # Most recent date → smallest age
+    best_date, best_source = max(candidates, key=lambda x: x[0])
+    return True, _days_ago(best_date), best_source, is_hollow
 
 
 def check_log(wiki_dir: Path) -> tuple[bool, Optional[int], str]:
@@ -202,10 +274,11 @@ def scan_projects(threshold: int) -> list[ProjectReport]:
         rpt = ProjectReport(wiki_name)
         rpt.status = (metadata.get(wiki_name, {}) or {}).get("status", "active")
 
-        exists, age, src = check_graph(wiki_root)
+        exists, age, src, hollow = check_graph(wiki_root)
         rpt.graph_exists = exists
         rpt.graph_age_days = age
         rpt.graph_source = src
+        rpt.graph_hollow = hollow
 
         log_exists, log_age, log_src = check_log(wiki_root / "wiki")
         rpt.log_exists = log_exists
@@ -260,13 +333,13 @@ def build_json_payload(reports: list[ProjectReport], threshold: int) -> dict:
     legacy = {
         "threshold_days": threshold,
         "today": date.today().isoformat(),
-        "projects": [r.to_dict() for r in reports],
+        "projects": [r.to_dict(threshold) for r in reports],
         "stale_count": sum(r.is_stale(threshold) for r in reports),
     }
 
     new_fields = {
         "checked": datetime.now().isoformat(timespec="seconds"),
-        "stale": [r.to_dict() for r in reports if r.is_stale(threshold)],
+        "stale": [r.to_dict(threshold) for r in reports if r.is_stale(threshold)],
         "fresh_count": sum(1 for r in reports if not r.is_stale(threshold)),
         "total": len(reports),
     }

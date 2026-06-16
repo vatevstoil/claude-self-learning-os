@@ -48,3 +48,44 @@ def test_canonical_names_are_stable():
 def test_empty_defaults():
     from ns_util import sanitize_ns
     assert sanitize_ns("") == "default"
+
+
+# ---------------------------------------------------------------------------
+# Mojibake input (cp1251-misread UTF-8 from Windows piped hook stdin)
+# Fixtures use NEUTRAL words only — this file ships publicly (see
+# test_encoding_guard.py for the same policy).
+# ---------------------------------------------------------------------------
+
+def _to_mojibake(s: str) -> str:
+    """Reproduce the hook-stdin corruption: UTF-8 bytes misread as cp1251."""
+    return s.encode("utf-8").decode("cp1251")
+
+
+def test_mojibake_input_repaired_before_translit():
+    from ns_util import sanitize_ns
+    # Without repair these would degrade to R/S husks like "RSRSSRRS"
+    assert sanitize_ns(_to_mojibake("Клошар")) == "Kloshar"
+    assert sanitize_ns(_to_mojibake("примерен проект")) == "primeren-proekt"
+
+
+def test_mojibake_repair_idempotent():
+    from ns_util import sanitize_ns
+    out = sanitize_ns(_to_mojibake("Клошар"))
+    assert sanitize_ns(out) == out
+
+
+def test_genuine_cyrillic_not_misrepaired():
+    from ns_util import sanitize_ns
+    # The repair must never fire on clean Cyrillic input
+    assert sanitize_ns("Клошар") == "Kloshar"
+    assert sanitize_ns("примерен проект") == "primeren-proekt"
+
+
+def test_research_wiki_alias_convergence():
+    from ns_util import sanitize_ns
+    # Hook-side map values and natural transliteration must converge on the
+    # SAME canonical ns, else save and recall fragment.
+    assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
+    assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
+    assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
+    assert sanitize_ns("Petar-Danov") == "PetarDanov"

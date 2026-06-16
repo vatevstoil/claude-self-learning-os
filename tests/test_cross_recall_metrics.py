@@ -133,3 +133,116 @@ def test_clean_project_name_not_altered(tmp_path, monkeypatch):
     crm = _setup(tmp_path, monkeypatch, surfaced, {})
     m = crm.compute(days=30, now=now)
     assert "Facturka.bg" in m["per_project"]
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS — unique_engaged dedup (Bug fix 2026-06-10)
+# ---------------------------------------------------------------------------
+
+def test_unique_engaged_no_double_count(tmp_path, monkeypatch):
+    """Same vector surfaced in two separate session events must count as 1 engaged,
+    not 2 (double-count bug fix)."""
+    now = datetime.now(timezone.utc)
+    ts1 = (now - timedelta(days=2)).isoformat(timespec="seconds")
+    ts2 = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    # 'v1' surfaced in two different sessions, hc0=1 both times
+    surfaced = [
+        {"ts": ts1, "project": "P", "enriched": True,
+         "surfaced": [{"ns": "_shared", "id": "v1", "score": 0.9, "hc0": 1}]},
+        {"ts": ts2, "project": "P", "enriched": True,
+         "surfaced": [{"ns": "_shared", "id": "v1", "score": 0.88, "hc0": 1}]},
+    ]
+    # v1 was recalled again (hc_now=3 > hc0=1 in both events)
+    tracker = {"v1": {"hit_count": 3}}
+    crm = _setup(tmp_path, monkeypatch, surfaced, tracker)
+    m = crm.compute(days=30, now=now)
+    # surfaced count is 2 (two occurrences), but unique engaged is 1
+    assert m["surfaced"] == 2
+    assert m["rerecalled"] == 1, "same id in two events must count as 1 re-recall"
+    assert m["engaged"] == 1, "double-count eliminated"
+    assert m["unique_engaged"] == 1
+
+
+def test_unique_engaged_field_present(tmp_path, monkeypatch):
+    """unique_engaged must always be present in output (backwards-compat new field)."""
+    now = datetime.now(timezone.utc)
+    ts = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    surfaced = [{"ts": ts, "project": "P", "enriched": True,
+                 "surfaced": [{"ns": "_shared", "id": "v1", "score": 0.9, "hc0": 0}]}]
+    crm = _setup(tmp_path, monkeypatch, surfaced, {"v1": {"hit_count": 2}})
+    m = crm.compute(days=30, now=now)
+    assert "unique_engaged" in m
+
+
+def test_unique_engaged_two_different_ids_count_separately(tmp_path, monkeypatch):
+    """Two different vectors both re-recalled must count as 2 unique_engaged."""
+    now = datetime.now(timezone.utc)
+    ts = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    surfaced = [{"ts": ts, "project": "P", "enriched": True,
+                 "surfaced": [
+                     {"ns": "_shared", "id": "va", "score": 0.9, "hc0": 0},
+                     {"ns": "_shared", "id": "vb", "score": 0.85, "hc0": 0},
+                 ]}]
+    tracker = {"va": {"hit_count": 2}, "vb": {"hit_count": 1}}
+    crm = _setup(tmp_path, monkeypatch, surfaced, tracker)
+    m = crm.compute(days=30, now=now)
+    assert m["rerecalled"] == 2
+    assert m["unique_engaged"] == 2
+
+
+def test_engagement_rate_corrected_with_dedup(tmp_path, monkeypatch):
+    """Engagement rate must use unique engaged / total surfaced (not raw event count)."""
+    now = datetime.now(timezone.utc)
+    ts = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    # v1 surfaced 6 times (1 per event), re-recalled each time => old code: 6 engaged
+    surfaced = [
+        {"ts": ts, "project": "P", "enriched": True,
+         "surfaced": [{"ns": "_shared", "id": "v1", "score": 0.9, "hc0": 1}]}
+        for _ in range(6)
+    ]
+    tracker = {"v1": {"hit_count": 5}}  # hc_now(5) > hc0(1) — re-recalled
+    crm = _setup(tmp_path, monkeypatch, surfaced, tracker)
+    m = crm.compute(days=30, now=now)
+    # surfaced=6, unique engaged=1 → rate = 1/6 ≈ 0.167, NOT 1.0
+    assert m["surfaced"] == 6
+    assert m["engaged"] == 1
+    assert m["engagement_rate"] == round(1 / 6, 3)
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS — type_filter for cross_project_search (Bug fix 2026-06-10)
+# ---------------------------------------------------------------------------
+
+def test_filter_meaningful_excludes_raw_passage():
+    """filter_meaningful() must exclude raw_passage and typeless vectors."""
+    import sys
+    sys.path.insert(0, str(Path.home() / ".claude" / "scripts"))
+    from cross_project_search import filter_meaningful
+
+    hits = [
+        {"id": "a", "metadata": {"type": "promoted", "text": "lesson"}},
+        {"id": "b", "metadata": {"type": "raw_passage", "text": "noise"}},
+        {"id": "c", "metadata": {"type": "learning", "text": "lesson"}},
+        {"id": "d", "metadata": {}, "score": 0.9},                         # typeless
+        {"id": "e", "metadata": {"type": "antipattern", "text": "pattern"}},
+    ]
+    result = filter_meaningful(hits)
+    ids = [h["id"] for h in result]
+    assert "a" in ids
+    assert "c" in ids
+    assert "e" in ids
+    assert "b" not in ids, "raw_passage must be excluded"
+    assert "d" not in ids, "typeless vector must be excluded"
+
+
+def test_filter_meaningful_all_meaningful_types():
+    """All six meaningful types must pass through filter_meaningful()."""
+    import sys
+    sys.path.insert(0, str(Path.home() / ".claude" / "scripts"))
+    from cross_project_search import filter_meaningful, MEANINGFUL_TYPES
+
+    hits = [
+        {"id": t, "metadata": {"type": t}} for t in MEANINGFUL_TYPES
+    ]
+    result = filter_meaningful(hits)
+    assert len(result) == len(MEANINGFUL_TYPES)

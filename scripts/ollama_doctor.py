@@ -56,8 +56,9 @@ _DIAG_PATH = Path.home() / ".claude" / "logs" / "ollama-doctor-last.json"
 
 
 def _write_diag(ok: bool, stage: str = "", reason: str = "", detail: str = "",
-                attempts: int = 0, path: Path = _DIAG_PATH) -> None:
+                attempts: int = 0, path: Path | None = None) -> None:
     """Write structured diagnostics to file (atomic) and stderr on failure."""
+    path = path or _DIAG_PATH  # resolved at call time so tests can repoint it
     ts = datetime.now(timezone.utc).isoformat()
     record: dict = {"ts": ts, "ok": ok, "stage": stage, "reason": reason,
                     "detail": detail, "attempts": attempts}
@@ -122,25 +123,64 @@ def healthy(embed_timeout: float = 20) -> bool:
 # --------------------------------------------------------------------------
 # Repairs
 # --------------------------------------------------------------------------
-_DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+_CREATE_NO_WINDOW = 0x08000000  # suppress the console flash when spawned from a hook
+_DETACHED = _CREATE_NO_WINDOW | 0x00000008 | 0x00000200  # + DETACHED_PROCESS | NEW_PROCESS_GROUP
 
 
-def _start_serve() -> None:
+def _start_serve() -> tuple[bool, str]:
+    """Spawn `ollama serve` detached. Returns (ok, err) — the spawn error must
+    NEVER be swallowed: a DENY-Execute ACE once appeared on ollama.exe and the
+    silent failure here made every repair report a misleading
+    'connection_refused' for days."""
     exe = _ollama_exe()
     try:
         subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,
                          creationflags=_DETACHED if os.name == "nt" else 0,
                          close_fds=True)
-    except Exception:
-        pass
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e} (exe={exe})"
+
+
+def _access_denied(err: str) -> bool:
+    return ("WinError 5" in err or "Access is denied" in err
+            or "PermissionError" in err)
+
+
+def _repair_exec_acl(log=lambda m: None) -> bool:
+    """Remove DENY ACEs for the current user from the Ollama executables.
+    Origin of the ACE is unknown (appeared around an Ollama self-update); the
+    user holds WRITE_DAC on the files so no elevation is needed. Returns True
+    if icacls succeeded on every existing exe."""
+    if os.name != "nt":
+        return False
+    user = os.environ.get("USERNAME", "")
+    if not user:
+        return False
+    exe_dir = Path(_ollama_exe()).parent
+    ok = True
+    for name in ("ollama.exe", "ollama app.exe"):
+        target = exe_dir / name
+        if not target.exists():
+            continue
+        try:
+            r = subprocess.run(["icacls", str(target), "/remove:d", user],
+                               capture_output=True, timeout=30,
+                               creationflags=_CREATE_NO_WINDOW if os.name == "nt" else 0)
+            ok = ok and r.returncode == 0
+        except Exception:
+            ok = False
+    log(f"ACL repair (remove DENY for {user}): {'ok' if ok else 'FAILED'}")
+    return ok
 
 
 def _kill() -> None:
     for name in ("ollama.exe", "ollama app.exe"):
         try:
             subprocess.run(["taskkill", "/F", "/IM", name],
-                           capture_output=True, timeout=15)
+                           capture_output=True, timeout=15,
+                           creationflags=_CREATE_NO_WINDOW if os.name == "nt" else 0)
         except Exception:
             pass
 
@@ -157,7 +197,8 @@ def _pull_model(log) -> None:
     exe = _ollama_exe()
     log(f"pulling {MODEL} (one-time)…")
     try:
-        subprocess.run([exe, "pull", MODEL], capture_output=True, timeout=900)
+        subprocess.run([exe, "pull", MODEL], capture_output=True, timeout=900,
+                       creationflags=_CREATE_NO_WINDOW if os.name == "nt" else 0)
     except Exception as e:
         log(f"pull failed: {e}")
 
@@ -203,7 +244,21 @@ def ensure(log=lambda m: None) -> bool:
         # 1) Not running → start.
         if not serving():
             log("not serving → starting `ollama serve`…")
-            _start_serve()
+            started, err = _start_serve()
+            attempts = 1
+            if not started and _access_denied(err):
+                # Known failure mode: DENY-Execute ACE on the exe → repair + retry once.
+                log(f"spawn failed ({err}) → repairing exec ACL and retrying…")
+                _repair_exec_acl(log)
+                started, err = _start_serve()
+                attempts = 2
+            if not started:
+                # Fail fast — no point waiting 25s for a process that never spawned.
+                _write_diag(ok=False, stage="spawn",
+                            reason="access_denied" if _access_denied(err) else "spawn_failed",
+                            detail=err, attempts=attempts)
+                log(f"RESULT: cannot spawn ollama serve ({err})")
+                return False
             if not _wait_serving(25):
                 _write_diag(ok=False, stage="server", reason="connection_refused",
                             detail="ollama serve started but did not respond within 25s", attempts=1)
@@ -224,7 +279,10 @@ def ensure(log=lambda m: None) -> bool:
                 log("serving but embed FAILS twice (stuck) → restart…")
                 _kill()
                 time.sleep(2)
-                _start_serve()
+                started, err = _start_serve()
+                if not started and _access_denied(err):
+                    _repair_exec_acl(log)
+                    _start_serve()
                 _wait_serving(25)
 
         # After a restart bge-m3 needs time to load into GPU — retry with increasing

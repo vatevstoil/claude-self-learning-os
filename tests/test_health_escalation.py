@@ -568,3 +568,224 @@ def test_remediate_uses_runner_injectable(tmp_path):
     # taskkill was called for both process names
     assert any("taskkill" in str(c) for c in calls)
     assert result["action"] == "restart_ollama"
+
+
+# ---------------------------------------------------------------------------
+# mark_run_state
+# ---------------------------------------------------------------------------
+
+def test_mark_run_state_running_creates_file(tmp_path):
+    from health_escalation import mark_run_state
+    p = tmp_path / "run-state-daily.json"
+    mark_run_state("daily", "RUNNING", pid=12345, now=NOW, path=p)
+    assert p.exists()
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["run_type"] == "daily"
+    assert data["status"] == "RUNNING"
+    assert data["pid"] == 12345
+    assert data["ts"] == NOW.isoformat()
+
+
+def test_mark_run_state_completed_overwrites(tmp_path):
+    from health_escalation import mark_run_state
+    p = tmp_path / "run-state-daily.json"
+    mark_run_state("daily", "RUNNING", pid=12345, now=NOW, path=p)
+    mark_run_state("daily", "COMPLETED", pid=12345, now=NOW, path=p)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["status"] == "COMPLETED"
+
+
+def test_mark_run_state_uses_own_pid_by_default(tmp_path):
+    import os as _os
+    from health_escalation import mark_run_state
+    p = tmp_path / "run-state-weekly.json"
+    mark_run_state("weekly", "RUNNING", path=p, now=NOW)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["pid"] == _os.getpid()
+
+
+# ---------------------------------------------------------------------------
+# detect_aborted_runs
+# ---------------------------------------------------------------------------
+
+def _write_state(directory: "Path", run_type: str, status: str, pid: int, ts: str) -> None:
+    """Helper: write a run-state sentinel directly."""
+    directory.mkdir(parents=True, exist_ok=True)
+    p = directory / f"run-state-{run_type}.json"
+    p.write_text(
+        json.dumps({"run_type": run_type, "status": status, "pid": pid, "ts": ts}),
+        encoding="utf-8",
+    )
+
+
+def test_detect_aborted_dead_pid(tmp_path):
+    """A RUNNING sentinel whose pid is dead is returned as aborted."""
+    from health_escalation import detect_aborted_runs
+    DEAD_PID = 99999999  # extremely unlikely to exist
+    _write_state(tmp_path, "daily", "RUNNING", DEAD_PID, NOW.isoformat())
+    with patch("health_escalation._pid_alive", return_value=False):
+        result = detect_aborted_runs(now=NOW, states_dir=tmp_path)
+    assert len(result) == 1
+    assert result[0]["run_type"] == "daily"
+
+
+def test_detect_aborted_old_timestamp(tmp_path):
+    """A RUNNING sentinel >12 h old is returned as aborted even if pid alive."""
+    from health_escalation import detect_aborted_runs
+    old_ts = (NOW - timedelta(hours=13)).isoformat()
+    _write_state(tmp_path, "weekly", "RUNNING", 99999, old_ts)
+    # pid_alive returns True — detection should still fire via age check
+    with patch("health_escalation._pid_alive", return_value=True):
+        result = detect_aborted_runs(now=NOW, states_dir=tmp_path)
+    assert len(result) == 1
+    assert result[0]["run_type"] == "weekly"
+
+
+def test_detect_aborted_running_alive_recent(tmp_path):
+    """A RUNNING sentinel with alive pid and recent ts is NOT aborted."""
+    from health_escalation import detect_aborted_runs
+    recent_ts = (NOW - timedelta(hours=1)).isoformat()
+    _write_state(tmp_path, "daily", "RUNNING", 99999, recent_ts)
+    with patch("health_escalation._pid_alive", return_value=True):
+        result = detect_aborted_runs(now=NOW, states_dir=tmp_path)
+    assert result == []
+
+
+def test_detect_aborted_completed_ignored(tmp_path):
+    """COMPLETED sentinels are never returned as aborted."""
+    from health_escalation import detect_aborted_runs
+    DEAD_PID = 99999999
+    _write_state(tmp_path, "daily", "COMPLETED", DEAD_PID, NOW.isoformat())
+    with patch("health_escalation._pid_alive", return_value=False):
+        result = detect_aborted_runs(now=NOW, states_dir=tmp_path)
+    assert result == []
+
+
+def test_detect_aborted_corrupt_state_file_skipped(tmp_path):
+    """Corrupt JSON in a state file must not crash detect_aborted_runs."""
+    from health_escalation import detect_aborted_runs
+    (tmp_path / "run-state-daily.json").write_text("{not json{{", encoding="utf-8")
+    result = detect_aborted_runs(now=NOW, states_dir=tmp_path)
+    assert result == []
+
+
+def test_detect_aborted_empty_dir(tmp_path):
+    from health_escalation import detect_aborted_runs
+    result = detect_aborted_runs(now=NOW, states_dir=tmp_path)
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# record_aborted
+# ---------------------------------------------------------------------------
+
+def test_record_aborted_appends_to_history(tmp_path):
+    from health_escalation import record_aborted
+    p = tmp_path / "history.jsonl"
+    record_aborted("daily", history_path=p, now=NOW)
+    lines = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert lines[0]["status"] == "ABORTED"
+    assert lines[0]["run_type"] == "daily"
+    assert lines[0]["ts"] == NOW.isoformat()
+
+
+def test_record_aborted_multiple_appends(tmp_path):
+    from health_escalation import record_aborted
+    p = tmp_path / "history.jsonl"
+    for rt in ("daily", "weekly", "daily"):
+        record_aborted(rt, history_path=p, now=NOW)
+    lines = [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 3
+
+
+# ---------------------------------------------------------------------------
+# consecutive_degraded — ABORTED counts as bad
+# ---------------------------------------------------------------------------
+
+def test_consecutive_aborted_counts_as_bad():
+    from health_escalation import consecutive_degraded
+    history = [
+        {**_OK_HEALTH, "run_type": "daily"},
+        {"status": "ABORTED", "run_type": "daily"},
+        {"status": "ABORTED", "run_type": "daily"},
+    ]
+    assert consecutive_degraded(history) == 2
+
+
+def test_consecutive_mixed_degraded_and_aborted():
+    from health_escalation import consecutive_degraded
+    history = [
+        {**_OK_HEALTH, "run_type": "daily"},
+        {**_DEGRADED_OLLAMA, "run_type": "daily"},
+        {"status": "ABORTED", "run_type": "daily"},
+    ]
+    assert consecutive_degraded(history) == 2
+
+
+def test_consecutive_aborted_broken_by_ok():
+    from health_escalation import consecutive_degraded
+    history = [
+        {"status": "ABORTED", "run_type": "daily"},
+        {**_OK_HEALTH, "run_type": "daily"},
+        {"status": "ABORTED", "run_type": "daily"},
+    ]
+    # Only the last ABORTED counts — the OK in the middle resets
+    assert consecutive_degraded(history) == 1
+
+
+def test_consecutive_run_type_filter_ignores_other_types():
+    from health_escalation import consecutive_degraded
+    weekly_ok = {**_OK_HEALTH, "run_type": "weekly"}
+    daily_aborted = {"status": "ABORTED", "run_type": "daily"}
+    history = [daily_aborted, weekly_ok, daily_aborted]
+    # weekly_ok must NOT break the daily streak
+    assert consecutive_degraded(history, run_type="daily") == 2
+    # without filter, weekly_ok IS in the tail → breaks streak → count=1
+    assert consecutive_degraded(history) == 1
+
+
+# ---------------------------------------------------------------------------
+# run_escalation — aborted runs integrated
+# ---------------------------------------------------------------------------
+
+def test_run_escalation_records_aborted_before_reading_history(tmp_path):
+    """If detect_aborted_runs finds a victim, record_aborted is called and the
+    ABORTED entry ends up in the history file before escalation logic runs."""
+    from health_escalation import run_escalation
+
+    hp = tmp_path / "health.json"
+    hist = tmp_path / "history.jsonl"
+    esc = tmp_path / "escalation.json"
+    esc_hist = tmp_path / "escalation-history.jsonl"
+    states = tmp_path / "states"
+
+    # Seed one prior DEGRADED so total bad = ABORTED(injected) + DEGRADED(seeded) + DEGRADED(current) = 3
+    _write_jsonl(hist, [{**_DEGRADED_OLLAMA, "run_type": "daily"}])
+    _write_json(hp, _DEGRADED_OLLAMA)
+
+    # Put a RUNNING sentinel with a dead pid
+    DEAD_PID = 99999999
+    _write_state(states, "daily", "RUNNING", DEAD_PID, NOW.isoformat())
+
+    with patch("health_escalation._pid_alive", return_value=False), \
+         patch("health_escalation.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0)
+        result = run_escalation(
+            health_path=hp,
+            history_path=hist,
+            escalation_path=esc,
+            escalation_hist_path=esc_hist,
+            threshold=2,
+            now=NOW,
+            remediator=_mock_remediation_success,
+            states_dir=states,
+        )
+
+    assert result is not None
+    assert result["action"] == "restart_ollama"
+
+    # Verify ABORTED was written to history
+    lines = [json.loads(ln) for ln in hist.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    aborted_entries = [ln for ln in lines if ln.get("status") == "ABORTED"]
+    assert len(aborted_entries) >= 1

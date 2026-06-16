@@ -30,6 +30,10 @@ SCRIPTS_DIR = Path(__file__).parent
 LOGS_DIR = Path.home() / ".claude" / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Make sibling helper modules importable (run-state sentinel, snapshot, notify).
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
 LOG_FILE = LOGS_DIR / "automation.log"
 HEALTH_PATH = LOGS_DIR / "health.json"
 FRESHNESS_OUT = LOGS_DIR / "freshness.json"
@@ -93,6 +97,30 @@ def run_safe(script_path: Path, args: list[str], timeout: int = 300) -> bool:
     except Exception as exc:
         log.error("%s: ERROR %s", name, exc)
         return False
+
+
+def _safe(fn_name: str, *args, **kwargs):
+    """Call an optional helper by name from a sibling module; never raise.
+
+    The scheduler requires the dispatcher to never crash, so every cross-module
+    helper (run-state sentinel, git snapshot, notify) is invoked through this
+    guard — a missing module or a helper error degrades to a logged no-op.
+    """
+    try:
+        mod_name, attr = fn_name.split(".", 1)
+        mod = __import__(mod_name)
+        return getattr(mod, attr)(*args, **kwargs)
+    except Exception as exc:
+        log.warning("helper %s failed: %s", fn_name, exc)
+        return None
+
+
+def _mark_state(run_type: str, status: str) -> None:
+    """Run-state sentinel: RUNNING at start, COMPLETED at end. If the scheduler
+    kills the process mid-run, the file stays RUNNING and health_escalation's
+    detect_aborted_runs surfaces it as ABORTED — otherwise the failure is
+    invisible (write_health never executed)."""
+    _safe("health_escalation.mark_run_state", run_type, status, os.getpid())
 
 
 def write_health(run_type: str, results: dict[str, bool]) -> None:
@@ -184,6 +212,10 @@ def write_pending_summary():
 
 def daily_tasks():
     log.info("=== DAILY RUN START ===")
+    _mark_state("daily", "RUNNING")
+    # Pre-mutation baseline: snapshot the system's own code BEFORE any
+    # auto-apply, so a bad self-modification today is diffable/revertible.
+    _safe("git_snapshot.snapshot", "pre-daily")
     results: dict[str, bool] = {}
     results["wiki_freshness"] = run_safe(SCRIPTS_DIR / "wiki_freshness_check.py",
              ["--out", str(FRESHNESS_OUT), "--threshold", "14"])
@@ -197,9 +229,14 @@ def daily_tasks():
     # Repeated corrections (>=3 similar in a project) become first-class
     # incidents — surfaced at the top of the daily brief, not just rule drafts.
     results["incident_tracker"] = run_safe(SCRIPTS_DIR / "incident_tracker.py", [], timeout=60)
+    # Strong recurring incidents get a drafted, human-gated fix-session prompt
+    # (review/launch manually — never auto-executed).
+    results["fix_proposer"] = run_safe(SCRIPTS_DIR / "incident_fix_proposer.py", [], timeout=60)
     # Heal the local memory backend FIRST (start/restart Ollama, pull bge-m3 if
     # missing) so the replay below actually has a working embedder to drain into.
-    results["ollama_doctor"] = run_safe(SCRIPTS_DIR / "ollama_doctor.py", ["--ensure", "--quiet"], timeout=210)
+    # 1100s: a missing-model pull can take minutes under GPU co-tenancy; the old
+    # 210s cap could time out and falsely mark the backend unhealthy.
+    results["ollama_doctor"] = run_safe(SCRIPTS_DIR / "ollama_doctor.py", ["--ensure", "--quiet"], timeout=1100)
     # Replay any saves queued while the backend was unavailable (Ollama down or,
     # in pinecone mode, embedding quota exhausted). Cheap no-op when queue empty.
     results["replay_pending_saves"] = run_safe(SCRIPTS_DIR / "pinecone.py", ["replay-queue"], timeout=120)
@@ -208,20 +245,34 @@ def daily_tasks():
     # anticipate must run daily — previously only in weekly dreaming, so the
     # SessionStart hook's 🔮 prediction was up to 6 days stale by mid-week.
     results["anticipate"] = run_safe(SCRIPTS_DIR / "anticipate.py", [], timeout=60)
+    # Rebuild the queue + KPI BEFORE the brief reads them — otherwise the brief
+    # shows last week's stale queue depth (was 149 vs real 38) and KPI.
+    results["improvement_queue"] = run_safe(SCRIPTS_DIR / "self_improvement_queue.py", [], timeout=60)
+    results["outcome_kpi"] = run_safe(SCRIPTS_DIR / "outcome_kpi.py", [], timeout=60)
+    # Integrity guard: invariant check that catches the system measuring itself
+    # with broken rulers (tool-ngram drafts, inflated precision, graph!=disk,
+    # mojibake, corrupt accepted-provenance). Runs BEFORE the brief reads it.
+    results["integrity_guard"] = run_safe(SCRIPTS_DIR / "integrity_guard.py", [], timeout=60)
     results["selfreg_monitor"] = run_safe(SCRIPTS_DIR / "selfreg_monitor.py", [])
-    # Morning brief (reads fresh selfreg/freshness state above). Captures yesterday's
-    # {open notes}. Pure-local, no embedding — safe under quota outage.
+    # Morning brief (reads fresh selfreg/freshness/queue/kpi state above). Captures
+    # yesterday's {open notes}. Pure-local, no embedding — safe under quota outage.
     results["daily_brief"] = run_safe(SCRIPTS_DIR / "daily_brief.py", [], timeout=60)
     write_health("daily", results)
+    _mark_state("daily", "COMPLETED")
     # Escalation reads the health.json just written: >=2 consecutive DEGRADED
     # triggers automatic remediation (e.g. Ollama restart) + escalation.json.
     # Runs AFTER write_health by design — not part of the graded results.
     run_safe(SCRIPTS_DIR / "health_escalation.py", [], timeout=300)
+    # Push the human ONLY when something needs them — escalation that failed
+    # remediation, and any open incidents. Dedup'd (20h) inside notify.py.
+    run_safe(SCRIPTS_DIR / "notify.py", ["escalation"], timeout=30)
+    run_safe(SCRIPTS_DIR / "notify.py", ["incidents"], timeout=30)
     log.info("=== DAILY RUN END ===")
 
 
 def weekly_tasks():
     log.info("=== WEEKLY RUN START ===")
+    _mark_state("weekly", "RUNNING")
     results: dict[str, bool] = {}
     results["wiki_freshness"] = run_safe(SCRIPTS_DIR / "wiki_freshness_check.py",
              ["--out", str(FRESHNESS_OUT), "--threshold", "14"])
@@ -245,7 +296,9 @@ def weekly_tasks():
     results["improvement_queue"] = run_safe(SCRIPTS_DIR / "self_improvement_queue.py", [], timeout=60)
     # LLM judge scores queue items (graceful no-op when Ollama unavailable) so
     # only semantically useful suggestions reach the human / auto-apply path.
-    results["llm_judge_queue"] = run_safe(SCRIPTS_DIR / "llm_judge.py", ["--judge-queue", "--max", "20"], timeout=600)
+    # 900s: the reasoning model needs ~60-120s/item; llm_judge persists after
+    # every item, so hitting this cap keeps all verdicts judged so far.
+    results["llm_judge_queue"] = run_safe(SCRIPTS_DIR / "llm_judge.py", ["--judge-queue", "--max", "20"], timeout=900)
     # knowledge_sync now embeds research wikis ({{RESEARCH_PATH}} concepts/sources)
     # in addition to project learnings — heaviest weekly task. Incremental after the
     # first full embed, but give generous headroom for big content drops.
@@ -260,12 +313,32 @@ def weekly_tasks():
     # Outcome KPI — measures RESULTS (repeat-correction rate, recall engagement,
     # apply-funnel throughput), unlike roi_tracker which counts activity.
     results["outcome_kpi"] = run_safe(SCRIPTS_DIR / "outcome_kpi.py", [], timeout=60)
+    # A/B counterfactual eval: per-rule before/after recurrence (interrupted
+    # time series). Weekly because a verdict needs >= window_days of
+    # post-application history. Surfaces regressed/no-effect auto-rules.
+    results["ab_eval"] = run_safe(SCRIPTS_DIR / "ab_eval.py", [], timeout=120)
     # Archive report (DRY): how many never-recalled old learning vectors are
     # dead weight. Apply stays a manual, backup-gated decision.
     results["memory_archiver_dry"] = run_safe(SCRIPTS_DIR / "memory_archiver.py", [], timeout=300)
+    # Stale human-review queues (DRY): promotions/cross-links pending >7d are
+    # reported to queue-aging.json for the daily brief. Apply stays manual.
+    results["queue_aging_dry"] = run_safe(SCRIPTS_DIR / "queue_aging.py", [], timeout=60)
+    # Skill usage audit (DRY/report-only): surfaces dead skills/commands that
+    # have not been invoked in 30d — the producer that populates skill-usage-audit.json
+    # which daily_brief.py already renders (dead_skills count). Without this call
+    # the consumer reads a stale or absent file.
+    results["skill_usage_audit"] = run_safe(SCRIPTS_DIR / "skill_usage_audit.py", [], timeout=60)
+    # Amnesty: clear implicit auto-dismissals so valid suggestions the UI hid
+    # (no accept/reject handle) get another chance. Idempotent; weekly cadence.
+    results["suggestion_amnesty"] = run_safe(SCRIPTS_DIR / "suggestion_feedback.py", ["amnesty"], timeout=30)
     results["selfreg_monitor"] = run_safe(SCRIPTS_DIR / "selfreg_monitor.py", [])
     write_health("weekly", results)
+    _mark_state("weekly", "COMPLETED")
     run_safe(SCRIPTS_DIR / "health_escalation.py", [], timeout=300)
+    # Weekly human digest (info level) — the otherwise-unread selfreg digest,
+    # pushed once a week so the human sees the trend without opening a file.
+    run_safe(SCRIPTS_DIR / "notify.py", ["digest"], timeout=30)
+    run_safe(SCRIPTS_DIR / "notify.py", ["escalation"], timeout=30)
     log.info("=== WEEKLY RUN END ===")
 
 
@@ -274,6 +347,7 @@ def dreaming_tasks():
     See: {{RESEARCH_PATH}}\\Claude Code Resurch\\wiki\\summaries\\Claude-OS-Dashboard-Jack.md
     """
     log.info("=== DREAMING RUN START ===")
+    _mark_state("dreaming", "RUNNING")
     results: dict[str, bool] = {}
     results["stage3_dreaming"] = run_safe(SCRIPTS_DIR / "stage3_dreaming.py", ["--days", "7"], timeout=600)
     results["skills_audit"] = run_safe(SCRIPTS_DIR / "skills_audit.py", [], timeout=120)
@@ -284,6 +358,8 @@ def dreaming_tasks():
     # Judge layer: prune tool-ngram junk drafts (the 477-drafts problem), then
     # LLM-score the survivors so auto-apply has a quality gate to consume.
     results["judge_prune"] = run_safe(SCRIPTS_DIR / "llm_judge.py", ["--prune-drafts", "--apply"], timeout=120)
+    # GC: rejected-draft dirs older than 30d (the dir grew to 600+ unbounded).
+    results["purge_rejected"] = run_safe(SCRIPTS_DIR / "llm_judge.py", ["--purge-rejected-days", "30", "--apply"], timeout=60)
     # max 6: each judgement can take up to 60s against local Ollama; 6*60=360s
     # leaves headroom inside the 600s cap instead of riding the timeout edge.
     results["judge_drafts"] = run_safe(SCRIPTS_DIR / "llm_judge.py", ["--judge-drafts", "--max", "6"], timeout=600)
@@ -294,24 +370,68 @@ def dreaming_tasks():
     results["boris_auto_apply"] = run_safe(SCRIPTS_DIR / "boris_draft.py", ["--auto-apply"], timeout=60)
     results["habit_auto_apply"] = run_safe(SCRIPTS_DIR / "habit_to_skill.py", ["--auto-apply"], timeout=60)
     results["incident_tracker"] = run_safe(SCRIPTS_DIR / "incident_tracker.py", [], timeout=60)
+    results["fix_proposer"] = run_safe(SCRIPTS_DIR / "incident_fix_proposer.py", [], timeout=60)
     results["improvement_queue"] = run_safe(SCRIPTS_DIR / "self_improvement_queue.py", [], timeout=60)
-    results["llm_judge_queue"] = run_safe(SCRIPTS_DIR / "llm_judge.py", ["--judge-queue", "--max", "20"], timeout=600)
+    # 900s: the reasoning model needs ~60-120s/item; llm_judge persists after
+    # every item, so hitting this cap keeps all verdicts judged so far.
+    results["llm_judge_queue"] = run_safe(SCRIPTS_DIR / "llm_judge.py", ["--judge-queue", "--max", "20"], timeout=900)
     results["effectiveness_tracker"] = run_safe(SCRIPTS_DIR / "effectiveness_tracker.py", [], timeout=60)
     results["outcome_kpi"] = run_safe(SCRIPTS_DIR / "outcome_kpi.py", [], timeout=60)
     results["anticipate"] = run_safe(SCRIPTS_DIR / "anticipate.py", [], timeout=60)
     # Hebbian consolidation — extend TTL for frequently recalled memories (salience-boosted)
     results["hebbian"] = run_safe(SCRIPTS_DIR / "hebbian_consolidation.py", ["--apply"], timeout=180)
     write_health("dreaming", results)
-    run_safe(SCRIPTS_DIR / "health_escalation.py", [], timeout=300)
+    _mark_state("dreaming", "COMPLETED")
+    # Capture what the system changed about ITSELF tonight (Boris rules applied,
+    # skills installed) as a labelled snapshot — the diff of self-modification.
+    _safe("git_snapshot.snapshot", "post-dreaming-autoapply")
+    # Dreaming escalates on the FIRST DEGRADED run (threshold=1) — a single failed
+    # dreaming session is already diagnostic. Daily/weekly retain threshold=2
+    # (one-off transient failures should not page).
+    run_safe(SCRIPTS_DIR / "health_escalation.py", ["--threshold", "1"], timeout=300)
+    run_safe(SCRIPTS_DIR / "notify.py", ["escalation"], timeout=30)
     log.info("=== DREAMING RUN END ===")
+
+
+_LOCK_PATH = LOGS_DIR / "dispatcher.lock"
+
+
+def _acquire_lock():
+    """Single-writer interprocess lock so daily/weekly/dreaming never overlap.
+
+    Overlapping runs corrupt shared state (queue, ledger, run-state) and double
+    the load. msvcrt.locking is released by the OS the instant the process dies
+    — no stale-lock cleanup logic needed. Returns the open handle (keep it alive
+    for the whole run) or None if another run holds the lock.
+    """
+    try:
+        import msvcrt
+        fh = open(_LOCK_PATH, "w", encoding="utf-8")
+        try:
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            return fh
+        except OSError:
+            fh.close()
+            return None
+    except Exception:
+        # Non-Windows or msvcrt unavailable: degrade to no lock rather than crash.
+        return True
 
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in ("daily", "weekly", "dreaming"):
-        log.error("Usage: automation_dispatcher.py daily|weekly|dreaming")
+        # Interactive misinvocation (human typo / inspection) — NOT an automation
+        # failure. Print usage to stderr but do NOT log at ERROR to automation.log:
+        # that log feeds selfreg health, and counting a no-arg CLI call as a
+        # failure falsely drags the health grade (the recurring "Usage:" issue).
+        print("Usage: automation_dispatcher.py daily|weekly|dreaming", file=sys.stderr)
         sys.exit(0)  # Always exit 0 for scheduler
 
     mode = sys.argv[1]
+    lock = _acquire_lock()
+    if lock is None:
+        log.warning("Another dispatcher run holds the lock — skipping %s run.", mode)
+        sys.exit(0)
     try:
         if mode == "daily":
             daily_tasks()
@@ -321,6 +441,12 @@ def main():
             dreaming_tasks()
     except Exception as exc:
         log.critical("Unhandled error in dispatcher: %s", exc, exc_info=True)
+        # Even on unhandled crash, record health so the failure is VISIBLE
+        # (the scheduler-kill case is covered separately by the run-state sentinel).
+        try:
+            write_health(mode, {"_dispatcher_crash": False})
+        except Exception:
+            pass
     finally:
         sys.exit(0)
 

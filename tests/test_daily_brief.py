@@ -3,6 +3,7 @@ import importlib
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+import json
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -87,3 +88,70 @@ def test_build_brief_renders_carried_notes():
                         ["напомни за релийза"])
     assert "Хванати бележки" in md
     assert "напомни за релийза" in md
+
+
+# ── memory backend (ollama doctor) line ──────────────────────────────────────
+
+def test_build_brief_memory_backend_ok_fresh():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    doctor = {"ts": "2026-06-05T08:00:00+00:00", "ok": True, "stage": "embed"}
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [],
+                        doctor=doctor)
+    assert "🧠 Memory backend: ✓" in md
+
+
+def test_build_brief_memory_backend_down():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    doctor = {"ts": "2026-06-05T08:00:00+00:00", "ok": False,
+              "stage": "spawn", "reason": "access_denied"}
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [],
+                        doctor=doctor)
+    assert "🧠 Memory backend: ❌ DOWN" in md
+    assert "stage=spawn" in md and "reason=access_denied" in md
+
+
+def test_build_brief_memory_backend_stale_or_missing():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    # ok=True but the diag is 3 days old → doctor stopped reporting.
+    doctor = {"ts": "2026-06-02T08:00:00+00:00", "ok": True}
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [],
+                        doctor=doctor)
+    assert "🧠 Memory backend: ❓ doctor не е репортвал" in md
+    # missing diag entirely
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [])
+    assert "🧠 Memory backend: ❓ няма doctor диагностика" in md
+
+
+# ── gemini briefs line ───────────────────────────────────────────────────────
+
+def test_build_brief_gemini_line_appears_when_count_nonzero():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [],
+                        gemini_briefs=3)
+    assert "📤 3 Gemini brief(s) готови за изпращане" in md
+    assert "~/.claude/gemini-tasks/" in md
+
+
+def test_build_brief_gemini_line_absent_when_count_zero():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [],
+                        gemini_briefs=0)
+    assert "Gemini brief" not in md
+
+
+def test_build_brief_gemini_default_is_zero():
+    # gemini_briefs kwarg defaults to 0 → line absent
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [])
+    assert "Gemini brief" not in md
+
+
+def test_build_brief_gemini_line_in_sistema_section():
+    # The line must appear inside the "## 📊 Система" section (before anticipations).
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [],
+                        gemini_briefs=2)
+    sistema_idx = md.index("## 📊 Система")
+    gemini_idx = md.index("📤 2 Gemini brief")
+    # Gemini line must come after the section header
+    assert gemini_idx > sistema_idx

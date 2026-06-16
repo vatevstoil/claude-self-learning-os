@@ -2,8 +2,15 @@
 """hebbian_consolidation.py -- Hebbian TTL: memories you recall live longer.
 
 "Fire together, wire together" -- if a Pinecone memory is recalled often,
-extend its TTL proportionally: effective_ttl = base_ttl x (1 + recall_count),
-capped at 9999 (NEVER_EXPIRE sentinel).
+extend its TTL proportionally using a log2 formula so noisy bulk recalls
+cannot ratchet TTL to NEVER_EXPIRE in one or two runs.
+
+Formula: ttl = min(ttl_base_for_type * (1 + log2(1 + hits)), NEVER_EXPIRE)
+where ttl_base_for_type comes from TYPE_BASE_TTL (never the current
+already-inflated ttl_days), stopping compound ratchet.
+
+Quality floor: only recalls with avg_score >= MIN_COSINE_SCORE count.
+Recalls below the floor are noise and do not extend TTL.
 
 Called from stage3_dreaming weekly pass. Safe to call multiple times (idempotent).
 
@@ -11,11 +18,14 @@ Usage:
     python hebbian_consolidation.py              # dry-run (print what would change)
     python hebbian_consolidation.py --apply      # apply TTL updates to Pinecone
     python hebbian_consolidation.py --min-count 3 --apply
+    python hebbian_consolidation.py --remediate  # one-shot reset of already-inflated TTLs
+    python hebbian_consolidation.py --remediate --apply
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -27,6 +37,23 @@ LOGS_DIR = Path.home() / ".claude" / "logs"
 DEFAULT_TRACKER = LOGS_DIR / "recall-tracker.json"
 DEFAULT_SALIENCE = LOGS_DIR / "salience.json"
 NEVER_EXPIRE = 9999
+
+# Quality floor: recalls with avg_score below this threshold are noise and
+# do NOT count toward Hebbian reinforcement (bge-m3 calibrated threshold).
+MIN_COSINE_SCORE: float = 0.60
+
+# Canonical TTL base per type — used in formula and remediation.
+# These are the AUTHORITATIVE values; TTL logic never reads back
+# the current (potentially inflated) ttl_days as the base.
+TYPE_BASE_TTL: dict[str, int] = {
+    "learning": 90,
+    "gotcha": 180,
+    "decision": 365,
+    "pattern": 365,
+    "antipattern": 365,
+    "promoted": NEVER_EXPIRE,
+}
+DEFAULT_BASE_TTL = 90  # fallback for unknown/typeless vectors
 
 # Salience bonus: high-stakes sessions extend TTL more aggressively
 # score >= 0.8 (SECURITY+MONEY) -> +2 virtual recalls; >= 0.5 -> +1
@@ -76,36 +103,56 @@ def load_salience(path: Path = DEFAULT_SALIENCE) -> dict[str, float]:
         return {}
 
 
-def compute_hebbian_ttl(base_ttl: int, recall_count: int) -> int:
-    """Compute effective TTL using Hebbian reinforcement formula.
-
-    Formula: min(base_ttl * (1 + recall_count), NEVER_EXPIRE).
-
-    Note: TTL compounds across weekly runs because base_ttl is read back from
-    the already-extended metadata value. This is intentional — actively-recalled
-    memories ratchet toward NEVER_EXPIRE (9999) quickly, which is the desired
-    "fire together, wire together" behavior. Memories that stop being recalled
-    will eventually expire via the cleanup_pinecone pass.
+def type_base_ttl(vtype: str | None) -> int:
+    """Return the canonical base TTL for a given vector type.
 
     Args:
-        base_ttl: TTL value in days currently stored in vector metadata.
-        recall_count: Number of times this vector has been recalled.
+        vtype: Value of meta['type']; None or unknown types fall back to
+               DEFAULT_BASE_TTL (90 days).
+
+    Returns:
+        Base TTL in days from TYPE_BASE_TTL, or DEFAULT_BASE_TTL.
+    """
+    return TYPE_BASE_TTL.get(vtype or "", DEFAULT_BASE_TTL)
+
+
+def compute_hebbian_ttl(base_ttl: int, recall_count: int) -> int:
+    """Compute effective TTL using logarithmic Hebbian reinforcement formula.
+
+    Formula: min(base_ttl * (1 + log2(1 + recall_count)), NEVER_EXPIRE).
+
+    The log2 damping prevents bulk-recall events from ratcheting TTL to
+    NEVER_EXPIRE in one or two runs (old linear formula: base * (1+count)
+    reached 9999 in a single pass with count=26 at base=365).
+
+    The caller MUST pass the TYPE-CANONICAL base_ttl (from type_base_ttl()),
+    never the current stored ttl_days — otherwise compound ratchet resumes.
+
+    Args:
+        base_ttl: Canonical TTL base for the vector's type (days).
+        recall_count: Number of quality-filtered recall hits (avg_score >= MIN_COSINE_SCORE).
 
     Returns:
         New TTL in days, capped at NEVER_EXPIRE (9999).
     """
-    return min(base_ttl * (1 + recall_count), NEVER_EXPIRE)
+    return min(int(base_ttl * (1 + math.log2(1 + recall_count))), NEVER_EXPIRE)
 
 
 def get_high_recall_ids(
     tracker_path: Path = DEFAULT_TRACKER,
     min_count: int = 2,
+    min_score: float = MIN_COSINE_SCORE,
 ) -> dict[str, dict]:
-    """Return vectors recalled >= min_count times from the recall tracker.
+    """Return vectors recalled >= min_count times AND above quality floor.
+
+    Vectors whose avg_score is below min_score are passive noise — bulk
+    embedding collisions that should not extend TTL. Only quality recalls count.
 
     Args:
         tracker_path: Path to the recall-tracker.json file.
         min_count: Minimum hit_count threshold to include a vector.
+        min_score: Minimum avg_score (cosine similarity) to consider a recall
+            meaningful. Defaults to MIN_COSINE_SCORE (0.60 for bge-m3).
 
     Returns:
         Dict mapping vector_id -> tracker entry for qualifying vectors.
@@ -120,7 +167,9 @@ def get_high_recall_ids(
     return {
         vid: info
         for vid, info in data.items()
-        if isinstance(info, dict) and info.get("hit_count", 0) >= min_count
+        if isinstance(info, dict)
+        and info.get("hit_count", 0) >= min_count
+        and float(info.get("avg_score", 1.0)) >= min_score
     }
 
 
@@ -222,7 +271,11 @@ def apply_hebbian_ttls(
             hit_info = next((i for v, i in entries if v == vid), None)
             if not hit_info:
                 continue
-            base_ttl = int(meta.get("ttl_days", 90))
+            # IMPORTANT: use the TYPE-canonical base, never the current stored
+            # ttl_days (which may already be inflated by previous runs).
+            # This stops compound ratchet.
+            vtype = meta.get("type") or ""
+            base_ttl = type_base_ttl(vtype)
             recall_count = hit_info.get("hit_count", 0)
             # Salience bonus: high-stakes sessions extend TTL more aggressively
             if salience:
@@ -269,6 +322,76 @@ def apply_hebbian_ttls(
     return logs
 
 
+def remediate_inflated_ttls(apply: bool = False) -> list[str]:
+    """One-shot reset of already-inflated TTLs back to their type canonical base.
+
+    Finds all local vectors that have ``hebbian_updated`` in metadata AND whose
+    type is not 'promoted', then resets their ttl_days to TYPE_BASE_TTL for that
+    type. This reverses the compound ratchet accumulated by the old linear formula.
+
+    Only operates on the LOCAL backend (local_rag). Pinecone cloud backend is
+    not touched by remediation — run against each backend separately.
+
+    Args:
+        apply: If True, write resets via local_rag.update_meta(). If False,
+            only count and describe what would be changed (dry-run).
+
+    Returns:
+        List of human-readable log lines.
+    """
+    logs: list[str] = []
+    try:
+        lr = _local()
+    except Exception as exc:
+        logs.append(f"SKIP remediation: local_rag unavailable ({exc})")
+        return logs
+
+    try:
+        all_ns = lr.all_namespaces()
+    except Exception as exc:
+        logs.append(f"SKIP remediation: cannot list namespaces ({exc})")
+        return logs
+
+    reset_count = 0
+    for ns in all_ns:
+        try:
+            rows = lr.fetch_all(ns)
+        except Exception as exc:
+            logs.append(f"SKIP ns={ns}: fetch_all failed ({exc})")
+            continue
+        for row in rows:
+            meta = row.get("metadata") or {}
+            if not meta.get("hebbian_updated"):
+                continue
+            vtype = meta.get("type") or ""
+            if vtype == "promoted":
+                continue  # promoted = intentionally immortal, do not touch
+            base = type_base_ttl(vtype)
+            current = int(meta.get("ttl_days", base))
+            if current == base:
+                continue  # already at base, nothing to do
+            vid = row["id"]
+            logs.append(
+                f"REMEDIATE ns={ns} id={vid} type={vtype or '?'}: "
+                f"ttl {current} -> {base}"
+            )
+            if apply:
+                new_meta = {**meta, "ttl_days": base,
+                            "hebbian_remediated": datetime.now(timezone.utc).isoformat(
+                                timespec="seconds")}
+                try:
+                    lr.update_meta(ns, vid, new_meta)
+                    reset_count += 1
+                except Exception as exc:
+                    logs.append(f"  ERROR updating {vid}: {exc}")
+            else:
+                reset_count += 1
+
+    action = "Would reset" if not apply else "Reset"
+    logs.append(f"[remediate] {action} {reset_count} inflated vector(s)")
+    return logs
+
+
 def main() -> None:
     """CLI entry point for Hebbian TTL consolidation."""
     parser = argparse.ArgumentParser(description="Hebbian TTL consolidation")
@@ -283,7 +406,21 @@ def main() -> None:
         default=2,
         help="Minimum recall count to trigger TTL extension",
     )
+    parser.add_argument(
+        "--remediate",
+        action="store_true",
+        help=(
+            "One-shot reset of already-inflated TTLs back to type-canonical base. "
+            "Use with --apply to actually write. Safe to run multiple times."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.remediate:
+        logs = remediate_inflated_ttls(apply=args.apply)
+        for line in logs:
+            print(f"  {line}", file=sys.stderr)
+        return
 
     high_recall = get_high_recall_ids(min_count=args.min_count)
     if not high_recall:

@@ -322,7 +322,7 @@ def detect_namespace(cwd: str) -> str | None:
     # Non-ASCII folder names → ASCII namespace (Pinecone ID compatibility)
     RESEARCH_NS_MAP = {
         "Петър Дънов": "PetarDanov",
-        "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
+        "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",  # must match sanitize_ns output — recall queries that ns
         "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
     }
     try:
@@ -532,7 +532,7 @@ def save_to_pinecone(namespace: str, entry_id: str, content: str,
     cmd = [sys.executable, str(PINECONE_CLI), "save", namespace, entry_id, content, "--meta", meta_arg]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=60,
+            cmd, capture_output=True, text=True, timeout=12,
             encoding="utf-8", errors="replace",
         )
         if result.returncode == 0:
@@ -550,8 +550,20 @@ def save_to_pinecone(namespace: str, entry_id: str, content: str,
                         result.returncode, (result.stderr or result.stdout)[:300])
             return False
     except subprocess.TimeoutExpired:
-        log.warning("pinecone.py timed out after 60s")
-        return False
+        # Safety net: subprocess killed before it could queue — write directly so
+        # the learning is not lost (primary fix is local_embed timeout=6 which
+        # lets pinecone.py queue itself via PineconeError before this fires).
+        try:
+            pending = Path.home() / ".claude" / "logs" / "pending-saves.jsonl"
+            pending.parent.mkdir(parents=True, exist_ok=True)
+            import json as _json
+            rec = {"namespace": namespace, "id": entry_id, "text": content, "meta": metadata}
+            with pending.open("a", encoding="utf-8") as _f:
+                _f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+            log.warning("pinecone.py timed out — emergency-queued to pending-saves.jsonl")
+        except Exception as eq:
+            log.warning("pinecone.py timed out and emergency-queue also failed: %s", eq)
+        return True  # queued = not lost
     except Exception as exc:
         log.warning("Failed to call pinecone.py: %s", exc)
         return False
@@ -570,6 +582,14 @@ def main() -> None:
         help="Test mode: read JSON from stdin but skip actual memory save if transcript missing.",
     )
     args = parser.parse_args()
+
+    # Hook payload is UTF-8 JSON, but Windows piped stdin defaults to the ANSI
+    # codepage (cp1251) — Cyrillic cwd would arrive as mojibake and fragment
+    # the namespace (e.g. "RSRSSRRS_RSRRR").
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     try:
         raw_input = sys.stdin.read()

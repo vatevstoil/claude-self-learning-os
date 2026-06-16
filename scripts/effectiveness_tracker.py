@@ -16,6 +16,7 @@ Files consumed (read-only):
     ~/.claude/logs/habit-ledger.json        — for habit resolution status
     ~/.claude/logs/skill-drafts/            — dirs = codified skills
     ~/.claude/logs/boris-drafts/            — files = acted-on boris rules
+    ~/.claude/logs/review-verdicts.json     — human accept/reject verdicts (exact match)
 
 Files maintained (written):
     ~/.claude/logs/queue-history.jsonl      — append-only snapshot log
@@ -30,6 +31,34 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+# Shared semantic filter — a skill-draft dir whose name is a pure tool-ngram
+# (e.g. "edit", "write-cat") carries no real skill and must NOT count as
+# "resolving" a habit. Tolerant import so this module never hard-fails if
+# llm_judge is unavailable (falls back to a length guard below).
+try:  # pragma: no cover - llm_judge is always present in practice
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from llm_judge import is_tool_ngram as _is_tool_ngram
+except Exception:  # pragma: no cover
+    _is_tool_ngram = None
+
+
+def _draft_dir_is_noise(name: str) -> bool:
+    """True if a skill-draft directory name must not count as resolving a habit.
+
+    Pure tool-ngram names (``edit``, ``read``, ``write``, ``write-cat`` ...) are
+    substrings of almost every habit id (habit ids encode tool sequences), so
+    treating them as resolutions fabricates habit precision. This guard is the
+    fix for the self-reinforcing precision-inflation bug: inflated precision
+    pushed ``suggest_thresholds`` to LOWER the distinctiveness bar, admitting
+    even more noise each cycle.
+    """
+    if _is_tool_ngram is not None and _is_tool_ngram(name):
+        return True
+    # Fallback when llm_judge cannot be imported: drop ultra-short single-tool
+    # names (edit=4, read=4, write=5) that cause the worst collisions.
+    return len(name) < 8
+
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -41,6 +70,7 @@ BORIS_DRAFTS_DIR = LOGS_DIR / "boris-drafts"
 HISTORY_PATH = LOGS_DIR / "queue-history.jsonl"
 EFFECTIVENESS_PATH = LOGS_DIR / "effectiveness.json"
 THRESHOLDS_PATH = LOGS_DIR / "thresholds.json"
+REVIEW_VERDICTS_PATH = LOGS_DIR / "review-verdicts.json"
 
 _DEFAULT_ANTICIPATIONS = Path.home() / ".claude" / "logs" / "anticipations.json"
 _DEFAULT_HABITS = Path.home() / ".claude" / "logs" / "habits.json"
@@ -113,27 +143,51 @@ def load_history(history_path: Path) -> list[dict[str, Any]]:
     return snapshots
 
 
+def _load_verdicts_tolerant(verdicts_path: Path) -> dict[str, Any]:
+    """Load review-verdicts.json safely; returns empty dict on any error.
+
+    Args:
+        verdicts_path: Path to the review-verdicts JSON file.
+
+    Returns:
+        Mapping of full item_id -> verdict entry dict.
+    """
+    try:
+        data = json.loads(verdicts_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def is_resolved(
     item: dict[str, Any],
     ledger: dict[str, Any],
     skill_drafts_dir: Path,
     boris_drafts_dir: Path,
+    verdicts_path: Path = REVIEW_VERDICTS_PATH,
 ) -> bool:
     """Determine whether a queue item has been acted on (resolved).
 
-    Resolution heuristics (documented, intentionally approximate):
+    Resolution priority (checked in order):
 
-    * ``habit``: Resolved if ANY directory inside ``skill_drafts_dir`` has a
-      name that is a substring of the item's ``id``.  The id format is
-      ``habit-{proj}-{tok1}-{tok2}-...`` (lowercased), and skill-draft dirs
-      are named after the routine tokens (e.g. ``pytest-edit``).
-      Also resolved if the ledger entry for the item has
-      ``status == "skill_exists"``.
+    1. **Human verdict (exact, canonical)**: if ``review-verdicts.json`` contains
+       a ``"accepted"`` entry for the item's full id, return ``True`` immediately.
+       This is the precise channel for human accept votes and is collision-free.
+       A ``"rejected"`` verdict returns ``False`` (explicitly not resolved).
 
-    * ``boris_rule``: Resolved if ANY file in ``boris_drafts_dir`` has a stem
-      (filename without extension) that appears as a substring within the
-      item's ``project`` or ``id``.  A boris-draft file being created is the
-      proxy for "acted on".
+    2. **Legacy file heuristics** (for real drafts created by other tools):
+
+       * ``habit``: Resolved if ANY directory inside ``skill_drafts_dir`` has a
+         name that is a substring of the item's ``id``.  The id format is
+         ``habit-{proj}-{tok1}-{tok2}-...`` (lowercased), and skill-draft dirs
+         are named after the routine tokens (e.g. ``pytest-edit``).
+         Also resolved if the ledger entry for the item has
+         ``status == "skill_exists"``.
+
+       * ``boris_rule``: Resolved if ANY file in ``boris_drafts_dir`` has a stem
+         (filename without extension) that appears as a substring within the
+         item's ``project`` or ``id``.  A boris-draft file being created is the
+         proxy for "acted on".
 
     * ``graphify``: Always ``False`` — cannot be reliably detected.
 
@@ -144,6 +198,8 @@ def is_resolved(
         ledger: Contents of habit-ledger.json (mapping key -> status dict).
         skill_drafts_dir: Directory containing skill-draft subdirectories.
         boris_drafts_dir: Directory containing boris-draft markdown files.
+        verdicts_path: Path to review-verdicts.json for exact human-verdict lookup.
+            Defaults to the real log path; inject a tmp path in tests.
 
     Returns:
         True if the item appears to have been resolved; False otherwise.
@@ -159,12 +215,34 @@ def is_resolved(
     if item_type == "graphify":
         return False
 
+    # --- Priority 1: exact human verdict (collision-free) ---
+    verdicts = _load_verdicts_tolerant(verdicts_path)
+    # Verdicts keys are stored in original case; item_id above is lowercased,
+    # so we check both the lowercased key and the original item id.
+    raw_item_id = item.get("id", "")
+    verdict_entry = verdicts.get(raw_item_id) or verdicts.get(item_id)
+    if verdict_entry is not None:
+        v = verdict_entry.get("verdict", "")
+        if v == "accepted":
+            return True
+        if v == "rejected":
+            return False
+        # Unknown verdict value — fall through to legacy heuristics
+
+    # --- Priority 2: legacy file heuristics (real drafts from other tools) ---
+
     if item_type == "habit":
         # Check skill-draft directories: resolved if any dir name is a substring of item id
         if skill_drafts_dir.exists():
             for entry in skill_drafts_dir.iterdir():
-                if entry.is_dir() and (entry.name.lower() in item_id
-                                       or entry.name.lower() in item_id_norm):
+                if not entry.is_dir():
+                    continue
+                # Tool-ngram dir names collide with nearly every habit id —
+                # never let them fabricate a resolution (precision inflation).
+                if _draft_dir_is_noise(entry.name):
+                    continue
+                if (entry.name.lower() in item_id
+                        or entry.name.lower() in item_id_norm):
                     return True
 
         # Check ledger for explicit skill_exists status
@@ -263,7 +341,8 @@ def suggest_thresholds(precision: dict[str, float]) -> dict[str, float]:
     - If habit precision < 0.3: multiply by 1.3 (raise bar — too much noise)
     - If habit precision > 0.7: multiply by 0.8 (lower bar — too strict)
     - Otherwise: keep base
-    - Clamped to [50.0, 500.0]
+    - Clamped to [150.0, 500.0] — never below base, to block the downward drift
+      a false-positive precision used to cause (audit: threshold-auto-tune-corrupted)
 
     Args:
         precision: Dict from ``precision_by_type``, e.g. ``{"habit": 0.25}``.
@@ -280,8 +359,9 @@ def suggest_thresholds(precision: dict[str, float]) -> dict[str, float]:
         elif habit_prec > 0.7:
             threshold = _BASE_DISTINCTIVENESS * 0.8
 
-    # Clamp to valid range
-    threshold = max(50.0, min(500.0, threshold))
+    # Clamp: never go below the base (prevents false-positive precision from
+    # lowering the bar and creating a self-reinforcing corruption loop).
+    threshold = max(_BASE_DISTINCTIVENESS, min(500.0, threshold))
 
     return {"habit_distinctiveness_min": threshold}
 
@@ -380,9 +460,10 @@ def main() -> None:
         # 4. Load auxiliary data for resolution checks
         ledger = _load_ledger(LEDGER_PATH)
 
-        # 5. Build resolution function bound to real paths
+        # 5. Build resolution function bound to real paths (verdicts_path uses default)
         def resolved_fn(item: dict[str, Any]) -> bool:
-            return is_resolved(item, ledger, SKILL_DRAFTS_DIR, BORIS_DRAFTS_DIR)
+            return is_resolved(item, ledger, SKILL_DRAFTS_DIR, BORIS_DRAFTS_DIR,
+                               verdicts_path=REVIEW_VERDICTS_PATH)
 
         # 6. Compute precision and sample counts
         precision = precision_by_type(history, resolved_fn)

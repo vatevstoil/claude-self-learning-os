@@ -31,6 +31,8 @@ _ALIASES = {
     "Web-Design": "WebDesign",
     "Web-Designe": "WebDesign",
     "Petar-Danov": "PetarDanov",
+    "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
+    "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
     "shared": "_shared",
 }
 
@@ -49,6 +51,16 @@ def sanitize_ns(name: str) -> str:
     """Return an ASCII, Pinecone-safe, canonical namespace for any name."""
     if not name:
         return "default"
+    if not name.isascii():
+        # Windows hooks pipe UTF-8 JSON into cp1251 text-mode stdin; a Cyrillic
+        # project name arrives as mojibake and would transliterate to an R/S
+        # husk (e.g. "RSRSSRRS"). Repair before transliterating; guard() is a
+        # no-op on genuine Cyrillic.
+        try:
+            from encoding_guard import guard
+            name = guard(name)
+        except Exception:
+            pass
     out = []
     for ch in name:
         low = ch.lower()

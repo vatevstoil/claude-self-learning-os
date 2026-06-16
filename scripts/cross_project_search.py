@@ -61,6 +61,28 @@ _JUNK_NAMESPACES: frozenset[str] = frozenset({
 })
 _MIN_VECTORS = 2  # skip single-vector test noise (e.g. a stray "Blender" ns)
 
+# Types that carry real lessons/decisions — surfaced by default.
+# raw_passage and typeless vectors are corpus noise (bulk ingest chunks) and
+# must not crowd out actual knowledge in top-k results.
+MEANINGFUL_TYPES: frozenset[str] = frozenset({
+    "promoted", "learning", "decision", "gotcha", "pattern", "antipattern",
+})
+
+
+def filter_meaningful(hits: list[dict]) -> list[dict]:
+    """Keep only hits whose meta['type'] is in MEANINGFUL_TYPES.
+
+    Args:
+        hits: List of result dicts with a 'metadata' key.
+
+    Returns:
+        Filtered list; preserves original order.
+    """
+    return [
+        h for h in hits
+        if (h.get("metadata") or {}).get("type") in MEANINGFUL_TYPES
+    ]
+
 
 def discover_namespaces() -> list[str]:
     """Return live namespaces from Pinecone, minus junk/near-empty ones.
@@ -221,6 +243,13 @@ def main() -> None:
         "--include-private", action="store_true",
         help="Override the privacy guard and ALSO search private namespaces",
     )
+    parser.add_argument(
+        "--raw", action="store_true",
+        help=(
+            "Include raw_passage and typeless vectors in results "
+            "(default: only meaningful types are shown)"
+        ),
+    )
     args = parser.parse_args()
 
     namespaces: list[str] = (
@@ -284,6 +313,18 @@ def main() -> None:
 
     # Sort all results by score descending
     all_hits.sort(key=lambda h: h.get("score", 0.0), reverse=True)
+
+    # Type filter: exclude raw_passage / typeless corpus chunks unless --raw.
+    if not args.raw:
+        before = len(all_hits)
+        all_hits = filter_meaningful(all_hits)
+        filtered_out = before - len(all_hits)
+        if filtered_out and not args.as_json:
+            print(
+                f"  [type_filter] {filtered_out} raw/typeless hit(s) hidden "
+                f"(use --raw to include all)",
+                file=sys.stderr,
+            )
 
     if args.as_json:
         _print_json(all_hits, empty_ns)

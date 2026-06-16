@@ -197,10 +197,17 @@ def main() -> None:
     prompt = build_prompt(info, stale, reason, task)
 
     LOGS.mkdir(parents=True, exist_ok=True)
+    prompt_ok = False
+    write_err = ""
     try:
         OUT.write_text(prompt, encoding="utf-8")
-    except Exception:
-        pass
+        # Verify the write actually landed — never claim prompt_written on faith
+        # (a swallowed failure once left a stale prompt from another project).
+        prompt_ok = OUT.read_text(encoding="utf-8") == prompt
+        if not prompt_ok:
+            write_err = "read-back mismatch (stale content left in place)"
+    except Exception as exc:
+        write_err = str(exc)
 
     # Machine-readable summary for the /handoff command to act on
     print("=== HANDOFF SUMMARY ===")
@@ -208,7 +215,10 @@ def main() -> None:
     print(f"graph_stale: {stale}  ({reason})")
     print(f"research_wiki: {info.get('kind') == 'research'}  (→ run knowledge_sync to embed latest)")
     print(f"current_task: {task or '(none in SPRINT)'}")
-    print(f"prompt_written: {OUT}")
+    if prompt_ok:
+        print(f"prompt_written: {OUT}")
+    else:
+        print(f"prompt_written: FAILED ({write_err or 'unknown'}) — {OUT} NOT updated; write the prompt manually")
     print()
     print("=== NEXT-SESSION PROMPT ===")
     print(prompt)

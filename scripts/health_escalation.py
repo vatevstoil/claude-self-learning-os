@@ -13,9 +13,15 @@ Remediation strategy (documented cure for the known Ollama failure mode):
 Deduplication: if the last escalation is <12 h old AND failures are identical,
 the action is suppressed ("suppressed_recent") to prevent flapping.
 
+Run-state sentinel: tracks whether a run started but never completed (e.g. killed
+by Task Scheduler timeout). Coordinator calls mark_run_state(type, "RUNNING") at
+start and mark_run_state(type, "COMPLETED") at end. detect_aborted_runs() finds
+runs whose pid is dead or whose timestamp is >12 h old while still RUNNING.
+
 CLI:
-    python health_escalation.py           # run escalation (safe, exit 0 always)
-    python health_escalation.py --status  # print last escalation + consecutive count
+    python health_escalation.py                # run escalation (safe, exit 0 always)
+    python health_escalation.py --status       # print last escalation + consecutive count
+    python health_escalation.py --check-aborted  # print aborted run-state sentinels
 """
 from __future__ import annotations
 
@@ -25,7 +31,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
@@ -40,6 +46,15 @@ _ESCALATION_PATH = _LOGS / "escalation.json"
 _ESCALATION_HIST_PATH = _LOGS / "escalation-history.jsonl"
 _SERVE_LOG = _LOGS / "ollama-serve.log"
 _SCRIPTS = Path.home() / ".claude" / "scripts"
+_STATES_DIR = _LOGS  # run-state-{run_type}.json files live here
+
+# Statuses used in run-state sentinel files
+_RS_RUNNING = "RUNNING"
+_RS_COMPLETED = "COMPLETED"
+_RS_ABORTED = "ABORTED"
+
+# How old a RUNNING sentinel must be (hours) to be considered abandoned
+_ABORTED_AGE_HOURS = 12
 
 _CREATE_NO_WINDOW = 0x08000000
 _DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
@@ -92,6 +107,172 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Run-state sentinel helpers
+# ---------------------------------------------------------------------------
+
+def mark_run_state(
+    run_type: str,
+    status: str,
+    pid: int | None = None,
+    now: datetime | None = None,
+    path: Path | None = None,
+) -> None:
+    """Write a run-state sentinel file for the given run_type.
+
+    Coordinator calls this with status="RUNNING" at the start of each run and
+    status="COMPLETED" at the end.  If the process is killed mid-run the file
+    stays as RUNNING and detect_aborted_runs() will surface it.
+
+    Args:
+        run_type: One of "daily", "weekly", "dreaming" (or any string).
+        status: "RUNNING", "COMPLETED", or "ABORTED".
+        pid: OS process ID (defaults to os.getpid()).
+        now: Timestamp override (for testing).
+        path: Full path override for the sentinel file (for testing).
+    """
+    _ts = (now or datetime.now(timezone.utc)).isoformat()
+    _pid = pid if pid is not None else os.getpid()
+    _path = path or (_STATES_DIR / f"run-state-{run_type}.json")
+    record: dict[str, Any] = {
+        "run_type": run_type,
+        "status": status,
+        "pid": _pid,
+        "ts": _ts,
+    }
+    _atomic_write(_path, record)
+
+
+def _probe_pid(pid: int) -> None:
+    """Existence probe: return if *pid* is alive, raise OSError when gone,
+    PermissionError when it exists but is unreachable.
+
+    On Windows os.kill(pid, 0) is NOT a safe probe — signal 0 is CTRL_C_EVENT,
+    a REAL Ctrl+C delivered to the target's console group (probing your own
+    process group kills the prober). Use OpenProcess instead.
+    """
+    if os.name == "nt":
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_ACCESS_DENIED = 5
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if handle:
+            try:
+                code = ctypes.c_ulong()
+                # OpenProcess can succeed for a recently-exited pid; the exit
+                # code distinguishes zombie handles from live processes.
+                if k32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != STILL_ACTIVE:
+                    raise OSError(f"pid {pid} has exited")
+            finally:
+                k32.CloseHandle(handle)
+            return
+        if k32.GetLastError() == ERROR_ACCESS_DENIED:
+            raise PermissionError(f"pid {pid}: access denied")
+        raise OSError(f"pid {pid} not found")
+    os.kill(pid, 0)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if *pid* is an existing, reachable process."""
+    try:
+        _probe_pid(pid)
+        return True
+    except PermissionError:
+        # A live process in a different session/context (e.g. dispatcher
+        # launched by Task Scheduler vs this checker) is unreachable but EXISTS
+        # — treating it as dead would forge an ABORTED record and could trip a
+        # needless Ollama remediation.
+        return True
+    except OSError:
+        return False
+    except Exception:
+        # Unexpected — assume alive to avoid false positives
+        return True
+
+
+def detect_aborted_runs(
+    now: datetime | None = None,
+    states_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Scan run-state sentinel files and return aborted candidates.
+
+    A run is considered aborted when its sentinel has status=="RUNNING" AND
+    either the recorded pid is no longer alive OR the sentinel timestamp is
+    older than _ABORTED_AGE_HOURS hours.
+
+    Args:
+        now: Timestamp override (for testing).
+        states_dir: Directory containing run-state-*.json files (for testing).
+
+    Returns:
+        List of sentinel dicts that appear to be aborted (may be empty).
+    """
+    _now = now or datetime.now(timezone.utc)
+    _dir = states_dir or _STATES_DIR
+    aborted: list[dict[str, Any]] = []
+
+    if not _dir.exists():
+        return aborted
+
+    for sentinel_path in _dir.glob("run-state-*.json"):
+        data = _load_json(sentinel_path)
+        if not data:
+            continue
+        if data.get("status") != _RS_RUNNING:
+            continue
+
+        # Check 1: pid dead
+        pid = data.get("pid")
+        if pid is not None:
+            try:
+                pid_int = int(pid)
+                if not _pid_alive(pid_int):
+                    aborted.append(dict(data))
+                    continue
+            except (TypeError, ValueError):
+                pass  # malformed pid — fall through to age check
+
+        # Check 2: timestamp too old
+        ts_raw = data.get("ts")
+        if ts_raw:
+            try:
+                ts = datetime.fromisoformat(ts_raw)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if _now.tzinfo is None:
+                    _now = _now.replace(tzinfo=timezone.utc)
+                age_hours = (_now - ts).total_seconds() / 3600
+                if age_hours > _ABORTED_AGE_HOURS:
+                    aborted.append(dict(data))
+            except Exception:
+                pass
+
+    return aborted
+
+
+def record_aborted(
+    run_type: str,
+    history_path: Path = _HISTORY_PATH,
+    now: datetime | None = None,
+) -> None:
+    """Append an ABORTED entry to the health-history JSONL so consecutive counters see it.
+
+    Args:
+        run_type: The run type that was aborted (e.g. "daily").
+        history_path: Path to health-history.jsonl.
+        now: Timestamp override (for testing).
+    """
+    _ts = (now or datetime.now(timezone.utc)).isoformat()
+    record: dict[str, Any] = {
+        "status": _RS_ABORTED,
+        "run_type": run_type,
+        "ts": _ts,
+    }
+    _append_jsonl(history_path, record)
+
+
+# ---------------------------------------------------------------------------
 # Core pure functions
 # ---------------------------------------------------------------------------
 
@@ -117,22 +298,29 @@ def consecutive_degraded(
     history: list[dict[str, Any]],
     run_type: str | None = None,
 ) -> int:
-    """Count consecutive DEGRADED entries from the tail of history.
+    """Count consecutive bad entries (DEGRADED or ABORTED) from the tail of history.
+
+    Both DEGRADED and ABORTED are treated as bad signals.  Counting stops at
+    the first entry that is neither DEGRADED nor ABORTED (e.g. OK).
+
+    When run_type is given the history is pre-filtered to that type only, so
+    a weekly-OK entry cannot accidentally break a daily-DEGRADED streak.
 
     Args:
         history: List of health records (oldest first).
         run_type: If set, filter to entries matching this run_type only.
 
     Returns:
-        Number of consecutive DEGRADED entries from the end.
+        Number of consecutive bad (DEGRADED or ABORTED) entries from the end.
     """
+    _BAD = {"DEGRADED", "ABORTED"}
     filtered = [
         h for h in history
         if run_type is None or h.get("run_type") == run_type
     ]
     count = 0
     for entry in reversed(filtered):
-        if entry.get("status") == "DEGRADED":
+        if entry.get("status") in _BAD:
             count += 1
         else:
             break
@@ -287,23 +475,41 @@ def run_escalation(
     threshold: int = 2,
     now: datetime | None = None,
     remediator: Any = remediate_ollama,
+    states_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     """Read health.json, maintain history, escalate when threshold is crossed.
+
+    Before reading history this function detects any aborted runs (processes
+    killed by Task Scheduler or other means) and records them in history so
+    the consecutive counter can see them as bad signals.
 
     Args:
         health_path: Path to current health.json.
         history_path: Path to health-history.jsonl.
         escalation_path: Path to escalation.json (latest record).
         escalation_hist_path: Path to escalation-history.jsonl.
-        threshold: Consecutive DEGRADED count that triggers escalation.
+        threshold: Consecutive bad (DEGRADED or ABORTED) count to trigger.
         now: Timestamp override (for testing).
         remediator: Callable matching remediate_ollama signature.
+        states_dir: Directory for run-state-*.json files (for testing).
 
     Returns:
         The escalation record written, or None if no escalation was triggered.
     """
     _now = now or datetime.now(timezone.utc)
     ts = _now.isoformat()
+
+    # --- Step 0: absorb aborted runs into history before reading it ----------
+    try:
+        aborted_runs = detect_aborted_runs(now=_now, states_dir=states_dir)
+        for aborted in aborted_runs:
+            record_aborted(
+                run_type=aborted.get("run_type", "unknown"),
+                history_path=history_path,
+                now=_now,
+            )
+    except Exception:
+        pass  # sentinel failures must never block escalation
 
     health = _load_json(health_path)
     if not health:
@@ -317,7 +523,9 @@ def run_escalation(
         return None
 
     history = _load_jsonl(history_path)
-    consec = consecutive_degraded(history)
+    # Filter by run_type when health record carries one, to avoid cross-type noise
+    _run_type = health.get("run_type") or None
+    consec = consecutive_degraded(history, run_type=_run_type)
 
     if consec < threshold:
         return None
@@ -421,20 +629,48 @@ def _status(
         print("\nLast escalation : none recorded", flush=True)
 
 
+def _check_aborted(states_dir: Path | None = None) -> None:
+    """Print any currently-aborted run-state sentinels to stdout."""
+    aborted = detect_aborted_runs(states_dir=states_dir)
+    if not aborted:
+        print("[run-state] No aborted runs detected.", flush=True)
+    else:
+        print(f"[run-state] {len(aborted)} aborted run(s) detected:", flush=True)
+        for entry in aborted:
+            print(
+                f"  run_type={entry.get('run_type')} "
+                f"pid={entry.get('pid')} "
+                f"ts={entry.get('ts')}",
+                flush=True,
+            )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--status", action="store_true",
                     help="Print current health + last escalation and exit")
+    ap.add_argument("--check-aborted", action="store_true",
+                    help="Print aborted run-state sentinels and exit (exit 0 always)")
+    ap.add_argument("--threshold", type=int, default=2,
+                    help="Consecutive bad runs before escalating (default: 2). "
+                         "Pass 1 for dreaming to escalate on first DEGRADED.")
     args = ap.parse_args()
 
     if args.status:
         _status()
         sys.exit(0)
 
+    if args.check_aborted:
+        try:
+            _check_aborted()
+        except Exception as exc:
+            print(f"[run-state] ERROR: {exc}", file=sys.stderr, flush=True)
+        sys.exit(0)
+
     # Default: run escalation logic (never raise, always exit 0)
     try:
-        result = run_escalation()
+        result = run_escalation(threshold=args.threshold)
         if result:
             print(f"[escalation] action={result.get('action')} "
                   f"needs_human={result.get('needs_human')}", flush=True)

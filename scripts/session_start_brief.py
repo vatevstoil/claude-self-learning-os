@@ -137,6 +137,11 @@ def _format_queue_item(item: object) -> str | None:
 
 
 def main() -> None:
+    # Hook payload is UTF-8 JSON; Windows piped stdin defaults to cp1251.
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:
+        pass
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
@@ -144,6 +149,15 @@ def main() -> None:
 
     cwd = payload.get("cwd") or os.getcwd()
     project = project_from_cwd(cwd)
+    # Defense in depth: if cwd carries Cyrillic (e.g. a "Петър Дънов" path), the
+    # parsed project bypasses ns_util's guard — repair any mojibake before it is
+    # written to cross-recall-surfaced.jsonl and skews per-project metrics.
+    if project:
+        try:
+            from encoding_guard import guard as _enc_guard
+            project = _enc_guard(project)
+        except Exception:
+            pass
 
     alerts: list[str] = []
 
@@ -293,12 +307,37 @@ def main() -> None:
                 # bge-m3 cosine scores run lower than e5's — calibrate the
                 # high-signal threshold per backend (e5≈0.82, bge-m3≈0.60).
                 _XTHRESH = 0.60 if _lr is not None else 0.82
+                # Only surface meaningful types — raw_passage and typeless chunks
+                # are bulk corpus noise and must not crowd out actual lessons.
+                _MEANINGFUL_TYPES = frozenset({
+                    "promoted", "learning", "decision",
+                    "gotcha", "pattern", "antipattern",
+                })
+
+                def _do_query_typed(ns, vec, topk):
+                    """Query with type_filter on local backend; post-filter for cloud."""
+                    if _lr is not None:
+                        return [
+                            {"id": h["id"], "score": h["score"],
+                             "metadata": h.get("meta", {})}
+                            for h in _lr.query_vec(
+                                vec, namespaces=[ns], topk=topk,
+                                type_filter=list(_MEANINGFUL_TYPES),
+                            )
+                        ]
+                    # Cloud Pinecone: no server-side type filter — post-filter client side
+                    raw = _do_query(ns, vec, topk * 4)  # fetch more to survive filtering
+                    return [
+                        m for m in raw
+                        if (m.get("metadata") or {}).get("type") in _MEANINGFUL_TYPES
+                    ][:topk]
+
                 _xhits = []
                 for _xns in ("_shared", "_claude_meta"):
                     if _xns == _ns:
                         continue
                     try:
-                        for _m in _do_query(_xns, _vec, 3):
+                        for _m in _do_query_typed(_xns, _vec, 3):
                             if _m.get("score", 0) >= _XTHRESH:
                                 _xhits.append((_xns, _m))
                     except Exception:
@@ -314,7 +353,7 @@ def main() -> None:
                     alerts.append(f"🔗 cross-project [{_xns}]: {_txt[:115]}")
                     _shown.append({"ns": _xns, "id": _m.get("id"),
                                    "score": round(float(_m.get("score", 0)), 4),
-                                   "t": _txt[:70]})
+                                   "t": _txt[:120]})
                     if len(_seen) >= 2:
                         break
 

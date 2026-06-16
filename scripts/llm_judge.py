@@ -17,7 +17,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -39,11 +41,14 @@ _QUEUE_PATH = Path.home() / ".claude" / "logs" / "improvement-queue.json"
 TOOL_TOKENS: frozenset[str] = frozenset(
     [
         "edit", "read", "grep", "echo", "cat", "ls", "write", "powershell",
+        "bash",  # catches "Bash:grep", "Bash:python" etc. after colon-split
         "python", "python3", "pythonexe", "pythonioenco", "git", "gh", "glob",
         "find", "head", "tail", "sed", "awk", "npx", "npm", "node",
-        "taskupdate", "taskcreate", "todowrite", "toolsearch", "markchapter",
+        "taskupdate", "taskcreate", "taskstop", "taskget", "tasklist",
+        "taskoutput", "todowrite", "toolsearch", "markchapter", "requestaccess",
+        "browserbatch", "sendmessage", "spawntask",
         "askuserquestion", "schedulewakeup", "usebrowser", "screenshot",
-        "zoom", "leftclick", "computerbatch", "previeweval", "previewscreenshot",
+        "zoom", "leftclick", "computer", "computerbatch", "previeweval", "previewscreenshot",
         "previewconsolelogs", "previewsnapshot", "openapplication", "navigate",
         "javascripttool", "for", "until", "while", "rm", "cp", "mv", "mkdir",
         "pwd", "sleep", "export", "program", "curl", "wget", "exitplanmode",
@@ -80,7 +85,17 @@ def is_tool_ngram(name: str) -> bool:
     """
     if not name:
         return False
-    parts = name.split("-")
+    # Split on both "-" and ":" so that "Bash:grep" is treated as two tokens
+    # ("bash" and "grep") rather than one unrecognised compound token.
+    # The slug builder in slugify_routine strips "Bash:" prefixes, but
+    # queue item ids (habit-{proj}-{routine[:3]}) keep the raw token form
+    # which may still carry "Bash:" prefixes.
+    import re as _re
+    parts = _re.split(r"[-:]", name.lower())
+    # Filter out empty strings from consecutive separators
+    parts = [p for p in parts if p]
+    if not parts:
+        return False
     n = len(parts)
     i = 0
     while i < n:
@@ -336,14 +351,76 @@ def _prune_drafts(
 
     if apply and junk_dirs:
         rejected_dir.mkdir(parents=True, exist_ok=True)
+        pruned_slugs: list[str] = []
         for d in junk_dirs:
             dest = rejected_dir / d.name
             try:
-                d.rename(dest)
+                if dest.exists():
+                    # Already rejected in a prior run — this is a regenerated
+                    # duplicate. Delete it outright rather than crashing on a
+                    # cross-device/FileExistsError rename (the bug that
+                    # silently failed on 473/479 dirs and swallowed the error).
+                    shutil.rmtree(d)
+                else:
+                    d.rename(dest)
+                pruned_slugs.append(d.name)
             except Exception as exc:
-                print(f"[llm_judge] warning: could not move {d.name}: {exc}", file=sys.stderr)
+                print(f"[llm_judge] warning: could not prune {d.name}: {exc}", file=sys.stderr)
+
+        # Best-effort: update habit ledger to mark pruned slugs so
+        # write_skill_drafts() does not regenerate them on the next cycle.
+        # The slug-to-ledger-key mapping is not 1:1 (slug = joined tokens,
+        # ledger key = "proj|t0>t1>...") so most mark_pruned calls will
+        # find 0 matching keys — that is expected and safe (no error raised).
+        if pruned_slugs:
+            try:
+                sys.path.insert(0, str(Path(__file__).resolve().parent))
+                from habit_ledger import mark_pruned as _mark_pruned
+                updated = _mark_pruned(pruned_slugs)
+                if updated:
+                    print(
+                        f"[llm_judge] mark_pruned updated {updated} ledger entries",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(
+                    f"[llm_judge] warning: could not update ledger after prune: {exc}",
+                    file=sys.stderr,
+                )
 
     return total, len(junk_dirs), kept
+
+
+def _purge_rejected(rejected_dir: Path, older_than_days: int, apply: bool,
+                    now: float | None = None) -> int:
+    """Delete rejected-draft directories older than *older_than_days* (mtime).
+
+    The skill-drafts-rejected dir grows unbounded (613 dirs / 700KB at audit
+    time) — junk is moved there but never removed. This is the GC backstop.
+
+    Args:
+        rejected_dir: The skill-drafts-rejected directory.
+        older_than_days: Age threshold in days (mtime-based).
+        apply: If False, count only (DRY run).
+        now: Injected epoch seconds (for tests); defaults to time.time().
+
+    Returns:
+        Number of directories removed (or that would be removed in DRY mode).
+    """
+    if not rejected_dir.exists():
+        return 0
+    ref = now if now is not None else time.time()
+    cutoff = ref - older_than_days * 86400
+    removed = 0
+    for entry in rejected_dir.iterdir():
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                if apply:
+                    shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _judge_drafts_cmd(
@@ -390,14 +467,57 @@ def _judge_drafts_cmd(
         print(f"[llm_judge] judged {judged} drafts")
 
 
+_QUEUE_TIMEOUT = 120  # default for queue/draft judging; CLI --timeout overrides
+
+
+_CONSECUTIVE_FAILURE_LIMIT = 3  # circuit breaker threshold
+
+
 def _judge_queue_cmd(
     queue_path: Path,
     max_n: int,
     model: str | None,
     base_url: str,
     timeout: int,
+    judge_text_fn: Any = None,
 ) -> None:
-    """LLM-judge up to max_n queue items lacking judge_score."""
+    """LLM-judge up to max_n queue items lacking judge_score.
+
+    **Ordering**: highest raw ``score`` first among eligible unscored items.
+
+    **Per-item None handling** (skip + continue, not abort):
+    A single failed item increments its ``judge_fail_count`` and is persisted
+    immediately; the batch continues with the next item.  This prevents one
+    poisoned item (e.g. one that reliably triggers HTTP 500) from blocking all
+    subsequent items on every run.
+
+    **Permanent error marking**: when ``judge_fail_count`` reaches 2 the item
+    receives ``judge_verdict="error"``, ``judge_score=0.0``, and a standard
+    reason string.  It is then excluded from the ``to_judge`` pool (treated the
+    same as a scored item) so it never blocks future batches.
+
+    **Circuit breaker**: ``_CONSECUTIVE_FAILURE_LIMIT`` (3) *consecutive*
+    failures in one run trigger an early stop — this indicates Ollama is
+    genuinely down rather than a single bad item.  The stop message reports
+    how many items were successfully judged before the breaker fired.  A
+    successful response resets the consecutive counter to 0.
+
+    **Incremental persist**: every item state change (success or fail) is
+    written to disk immediately so no work is lost on interruption.
+
+    **Eligible items**: ``judge_score is None`` AND ``judge_fail_count < 2``
+    (items already permanently marked ``error`` are skipped).
+
+    Args:
+        queue_path: Path to the improvement-queue.json file.
+        max_n: Maximum number of eligible items to attempt in this run.
+        model: Ollama model name (None → env/default).
+        base_url: Ollama base URL.
+        timeout: HTTP timeout in seconds.
+        judge_text_fn: Optional callable replacing ``judge_text`` for tests.
+    """
+    _judge_fn = judge_text_fn if judge_text_fn is not None else judge_text
+
     if not queue_path.exists():
         print("[llm_judge] queue file not found", file=sys.stderr)
         return
@@ -411,13 +531,16 @@ def _judge_queue_cmd(
     except Exception:
         items = []
 
+    # Eligible: unscored AND not permanently error-marked (fail_count < 2).
     to_judge = [
         (idx, item) for idx, item in enumerate(items)
         if item.get("judge_score") is None
+        and int(item.get("judge_fail_count") or 0) < 2
     ]
+    to_judge.sort(key=lambda t: float(t[1].get("score") or 0.0), reverse=True)
 
     judged = 0
-    unavailable = False
+    consecutive_failures = 0
 
     for idx, item in to_judge[:max_n]:
         description = item.get("description", "")
@@ -429,28 +552,52 @@ def _judge_queue_cmd(
             f"Description: {description}"
         )
 
-        result = judge_text(
+        result = _judge_fn(
             system_prompt=_SYSTEM_PROMPT_QUEUE,
             user_text=user_text,
             model=model,
             base_url=base_url,
             timeout=timeout,
         )
-        if result is None:
-            unavailable = True
-            break
 
+        if result is None:
+            consecutive_failures += 1
+            fail_count = int(items[idx].get("judge_fail_count") or 0) + 1
+            items[idx]["judge_fail_count"] = fail_count
+
+            if fail_count >= 2:
+                # Permanently remove from future batches.
+                items[idx]["judge_verdict"] = "error"
+                items[idx]["judge_score"] = 0.0
+                items[idx]["judge_reason"] = (
+                    "no response after 2 attempts (timeout or server error)"
+                )
+                print(
+                    f"[llm_judge] item {item_id!r} permanently marked error"
+                    f" (fail_count={fail_count})"
+                )
+
+            # Persist the updated fail_count / error verdict immediately.
+            _atomic_write_json(queue_path, items)
+
+            if consecutive_failures >= _CONSECUTIVE_FAILURE_LIMIT:
+                print(
+                    f"[llm_judge] stopped after {_CONSECUTIVE_FAILURE_LIMIT}"
+                    f" consecutive failures (ollama down?) — judged {judged}"
+                )
+                return
+
+            # Single failure — skip this item and continue.
+            continue
+
+        # Success path.
+        consecutive_failures = 0
         items[idx]["judge_score"] = result["score"]
         items[idx]["judge_reason"] = result["reason"]
         items[idx]["judge_verdict"] = result["verdict"]
         judged += 1
+        _atomic_write_json(queue_path, items)
 
-    if unavailable:
-        print("[llm_judge] judge unavailable — no-op", file=sys.stderr)
-        return
-
-    # Atomic write
-    _atomic_write_json(queue_path, items)
     print(f"[llm_judge] judged {judged} queue items")
 
 
@@ -502,12 +649,21 @@ def main() -> None:
         help="LLM-judge non-junk drafts without judge.json",
     )
     p.add_argument(
+        "--purge-rejected-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Delete rejected-draft dirs older than N days (needs --apply to act)",
+    )
+    p.add_argument(
         "--judge-queue",
         action="store_true",
         help="LLM-judge queue items without judge_score",
     )
     p.add_argument(
         "--max",
+        "--limit",
+        dest="max",
         type=int,
         default=None,
         help="Max items to judge (default 10 for drafts, 20 for queue)",
@@ -525,8 +681,11 @@ def main() -> None:
     p.add_argument(
         "--timeout",
         type=int,
-        default=60,
-        help="HTTP timeout in seconds",
+        default=None,
+        help=(
+            "HTTP timeout in seconds.  Defaults to 120 for --judge-queue "
+            "(reasoning models need headroom), 60 for all other commands."
+        ),
     )
     # Path overrides (primarily for testing)
     p.add_argument("--drafts-dir", default=None)
@@ -539,7 +698,8 @@ def main() -> None:
     rejected_dir = Path(args.rejected_dir) if args.rejected_dir else _REJECTED_DIR
     queue_path = Path(args.queue_path) if args.queue_path else _QUEUE_PATH
 
-    if not (args.prune_drafts or args.judge_drafts or args.judge_queue):
+    if not (args.prune_drafts or args.judge_drafts or args.judge_queue
+            or args.purge_rejected_days is not None):
         p.print_help()
         sys.exit(0)
 
@@ -548,24 +708,33 @@ def main() -> None:
         mode = "APPLY" if args.apply else "DRY"
         print(f"[llm_judge] prune-drafts [{mode}]  total={total}  junk={junk}  kept={kept}")
 
+    if args.purge_rejected_days is not None:
+        n = _purge_rejected(rejected_dir, args.purge_rejected_days, apply=args.apply)
+        mode = "APPLY" if args.apply else "DRY"
+        print(f"[llm_judge] purge-rejected [{mode}]  removed={n} (older than {args.purge_rejected_days}d)")
+
     if args.judge_drafts:
         max_n = args.max if args.max is not None else 10
+        timeout = args.timeout if args.timeout is not None else 60
         _judge_drafts_cmd(
             drafts_dir=drafts_dir,
             max_n=max_n,
             model=args.model,
             base_url=args.base_url,
-            timeout=args.timeout,
+            timeout=timeout,
         )
 
     if args.judge_queue:
         max_n = args.max if args.max is not None else 20
+        # Reasoning models (e.g. gemma4:hermes) take 60-120 s/item; use a
+        # higher default so a slow response is not misreported as "down".
+        timeout = args.timeout if args.timeout is not None else _QUEUE_TIMEOUT
         _judge_queue_cmd(
             queue_path=queue_path,
             max_n=max_n,
             model=args.model,
             base_url=args.base_url,
-            timeout=args.timeout,
+            timeout=timeout,
         )
 
 

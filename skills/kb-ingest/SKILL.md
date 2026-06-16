@@ -224,6 +224,14 @@ Prepend new section:
 
 Add to `critical_rules[]` if new non-obvious rule found.
 
+**Sidecar entities (from /research):** if a `<slug>.entities.json` exists next to the raw
+file, merge its keyed entities/relations into the graph instead of re-extracting from prose:
+
+- Dedup entities by `identifiers.entity_id` (default field: `name`).
+- Dedup relations by `identifiers.relation_id` (e.g. `{source}|{type}|{target}`).
+- Add new entities/relations to the correct cluster's `files[]` / graph nodes; skip exact-key duplicates.
+- If no sidecar exists, fall back to the existing summary-based extraction (unchanged, backward-compatible).
+
 ### 3d. Add to NotebookLM
 
 ```

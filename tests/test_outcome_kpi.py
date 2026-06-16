@@ -62,7 +62,7 @@ def test_repeat_rate_no_clusters():
     from outcome_kpi import compute_repeat_rate
 
     result = compute_repeat_rate({}, now=NOW)
-    assert result == {"total": 0, "repeats": 0, "rate": 0.0}
+    assert result == {"total": 0, "repeats": 0, "rate": 0.0, "measurable": True}
 
 
 def test_repeat_rate_zero_corrections_in_window():
@@ -119,6 +119,53 @@ def test_repeat_rate_mixed_clusters():
     assert result["total"] == 2
     assert result["repeats"] == 1
     assert result["rate"] == pytest.approx(0.5, abs=0.001)
+
+
+def test_repeat_rate_bulk_single_timestamp_unmeasurable():
+    """>=3 corrections collapsed onto one timestamp = bulk import, no signal."""
+    from outcome_kpi import compute_repeat_rate
+    recent = NOW - timedelta(days=2)
+    state = _make_state([_cluster("c1", first_seen=recent,
+                                  examples=[recent, recent, recent, recent])])
+    result = compute_repeat_rate(state, window_days=WINDOW, now=NOW)
+    assert result["measurable"] is False
+    assert result["rate"] is None
+    assert result["total"] == 4  # still counted, just not rate-measurable
+
+
+def test_repeat_rate_small_n_single_timestamp_still_measurable():
+    """A lone recurrence (n<3) with one timestamp is legitimate, not garbage."""
+    from outcome_kpi import compute_repeat_rate
+    old = NOW - timedelta(days=20)
+    recent = NOW - timedelta(days=1)
+    state = _make_state([_cluster("c1", first_seen=old, examples=[recent])])
+    result = compute_repeat_rate(state, window_days=WINDOW, now=NOW)
+    assert result["measurable"] is True
+    assert result["rate"] == 1.0
+
+
+def test_recall_engagement_flags_stale_metrics(tmp_path):
+    """Recall metrics older than 24h are annotated stale."""
+    from outcome_kpi import _compute_recall_engagement
+    old_gen = (NOW - timedelta(hours=48)).isoformat()
+    p = tmp_path / "recall.json"
+    p.write_text(json.dumps({"surfaced": 100, "engaged": 1,
+                             "engagement_rate": 0.01, "generated": old_gen}),
+                 encoding="utf-8")
+    out = _compute_recall_engagement(p, now=NOW)
+    assert out["stale"] is True
+    assert out["stale_hours"] >= 24
+
+
+def test_recall_engagement_fresh_not_flagged(tmp_path):
+    from outcome_kpi import _compute_recall_engagement
+    fresh = (NOW - timedelta(hours=2)).isoformat()
+    p = tmp_path / "recall.json"
+    p.write_text(json.dumps({"surfaced": 5, "engaged": 1,
+                             "engagement_rate": 0.2, "generated": fresh}),
+                 encoding="utf-8")
+    out = _compute_recall_engagement(p, now=NOW)
+    assert out.get("stale") is not True
 
 
 def test_repeat_rate_example_exactly_at_window_boundary_excluded():
@@ -203,10 +250,12 @@ def test_compute_kpi_all_files_missing(tmp_path):
         history_path=tmp_path / "history.jsonl",
     )
     assert result["window_days"] == 7
-    assert result["repeat_corrections"] == {"total": 0, "repeats": 0, "rate": 0.0}
+    assert result["repeat_corrections"] == {"total": 0, "repeats": 0, "rate": 0.0, "measurable": True}
     assert result["recall_engagement"] == {"surfaced": None, "engaged": None, "rate": None}
-    assert result["apply_funnel"]["applied_30d"] == 0
-    assert result["apply_funnel"]["rolled_back_30d"] == 0
+    # Missing ledger must read as "no data" (None), NOT a confident 0.
+    assert result["apply_funnel"]["applied_30d"] is None
+    assert result["apply_funnel"]["rolled_back_30d"] is None
+    assert result["apply_funnel"]["ledger_missing"] is True
     assert result["apply_funnel"]["queue_depth"] == 0
     assert result["apply_funnel"]["open_incidents"] == 0
     assert result["trend"] == "insufficient_data"

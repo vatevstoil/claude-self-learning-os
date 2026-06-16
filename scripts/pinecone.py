@@ -153,7 +153,22 @@ def _do_save(namespace, entry_id, text, meta: dict) -> None:
 
 
 def _queue_pending(rec: dict) -> None:
-    """Append one failed save to the local fallback queue (never lose a learning)."""
+    """Append one failed save to the local fallback queue (never lose a learning).
+
+    EXCEPT private namespaces: their content must never sit in a plaintext queue
+    file. A failed private save is dropped (accepted loss) — these are session
+    wrap-ups, not irreplaceable learnings, and privacy outranks durability.
+    """
+    ns = rec.get("namespace", "")
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from visibility_guard import private_namespaces
+        if ns in private_namespaces():
+            print(f"[pinecone] private namespace '{ns}' NOT queued — plaintext-leak guard",
+                  file=sys.stderr)
+            return
+    except Exception:
+        pass  # guard is best-effort; never block a legitimate queue write
     PENDING_QUEUE.parent.mkdir(parents=True, exist_ok=True)
     with PENDING_QUEUE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")

@@ -1,8 +1,31 @@
 import json
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
 
 sys.path.insert(0, str(Path.home() / ".claude" / "scripts"))
+
+
+@pytest.fixture(autouse=True)
+def _stub_llm(monkeypatch):
+    """Safety net: NO boris_draft test may hit the real Ollama endpoint.
+
+    synthesize_rule_with_llm auto-imports ``llm_judge.judge_text`` whenever no
+    judge_text_fn is injected. On a machine with Ollama actually running, that
+    became a real, slow LLM call — the full suite hung for >4 minutes because of
+    it. We patch the transport to a fast deterministic stub. Tests that inject
+    their own judge_text_fn are unaffected (they never import llm_judge), and a
+    test that needs to simulate an unavailable LLM re-patches it to return None.
+    """
+    import llm_judge
+    monkeypatch.setattr(
+        llm_judge, "judge_text",
+        lambda *a, **k: {"verdict": "junk", "score": 0.9,
+                         "reason": "stubbed test rule (no live LLM)"},
+        raising=False,
+    )
 
 
 def test_generate_draft_contains_rule_and_evidence():
@@ -175,3 +198,190 @@ def test_resolve_ambiguous_returns_none(tmp_path):
 def test_resolve_missing_parent_returns_none(tmp_path):
     from boris_draft import _resolve_real_project_dir
     assert _resolve_real_project_dir(str(tmp_path / "no_such_parent" / "Proj")) is None
+
+
+# ===========================================================================
+# NEW TESTS — correction detector, LLM synthesis, dedup
+# ===========================================================================
+
+
+class TestIsCorrection:
+    """Тестове за новия детектор на корекции."""
+
+    def test_pure_question_mark_not_correction(self):
+        from boris_draft import is_correction
+        assert is_correction("може ли да анализираш компанията Realty Income?") is False
+
+    def test_question_starter_without_negation_not_correction(self):
+        from boris_draft import is_correction
+        assert is_correction("може ли да ми покажеш как работи модулът") is False
+
+    def test_question_starter_with_negation_is_correction(self):
+        """'може ли' + 'не работи' → реална жалба, не въпрос."""
+        from boris_draft import is_correction
+        assert is_correction("може ли клавишната комбинация да не работи") is True
+
+    def test_system_reminder_excluded(self):
+        from boris_draft import is_correction
+        assert is_correction("<system-reminder>Some system content</system-reminder>") is False
+
+    def test_stop_hook_feedback_excluded(self):
+        from boris_draft import is_correction
+        msg = "Stop hook feedback:\n⚠ Wiki/Reed: log.md не е обновено 21д"
+        assert is_correction(msg) is False
+
+    def test_stop_hook_feedback_case_insensitive(self):
+        from boris_draft import is_correction
+        assert is_correction("STOP HOOK FEEDBACK: something") is False
+
+    def test_real_keyboard_complaint_is_correction(self):
+        from boris_draft import is_correction
+        assert is_correction("клавишната комбинация за четене отново не работи") is True
+
+    def test_real_terminal_complaint_is_correction(self):
+        from boris_draft import is_correction
+        assert is_correction("постоянно се отваря терминала и не се затваря") is True
+
+    def test_real_dashboard_complaint_is_correction(self):
+        from boris_draft import is_correction
+        assert is_correction("дескборда неработи на 70% съм за да продам") is True
+
+    def test_pure_question_with_question_mark_filtered(self):
+        from boris_draft import is_correction
+        # Ends with '?' and no negation word
+        assert is_correction("кога ще е готово?") is False
+
+    def test_empty_string_not_correction(self):
+        from boris_draft import is_correction
+        assert is_correction("") is False
+        assert is_correction("   ") is False
+
+
+class TestDedupTokens:
+    """Triple token deduplication."""
+
+    def test_triple_stop_collapsed(self):
+        from boris_draft import _dedup_tokens
+        result = _dedup_tokens("стоп стоп стоп стоп направи това")
+        tokens = result.split()
+        # At most 2 consecutive identical tokens
+        for i in range(2, len(tokens)):
+            assert not (tokens[i] == tokens[i - 1] == tokens[i - 2]), (
+                f"Triple repetition found at position {i}: {tokens}"
+            )
+
+    def test_double_allowed(self):
+        from boris_draft import _dedup_tokens
+        result = _dedup_tokens("стоп стоп направи")
+        assert result == "стоп стоп направи"
+
+    def test_no_repetition_unchanged(self):
+        from boris_draft import _dedup_tokens
+        text = "клавишната комбинация не работи"
+        assert _dedup_tokens(text) == text
+
+
+class TestFilterCorrections:
+    """filter_corrections pipeline."""
+
+    def test_filters_out_questions(self):
+        from boris_draft import filter_corrections
+        examples = [
+            "може ли да ми помогнеш?",
+            "клавишната комбинация не работи",
+        ]
+        result = filter_corrections(examples)
+        assert len(result) == 1
+        assert "клавишната" in result[0]
+
+    def test_filters_system_noise(self):
+        from boris_draft import filter_corrections
+        examples = [
+            "Stop hook feedback:\n⚠ some noise",
+            "програмата неработи",
+        ]
+        result = filter_corrections(examples)
+        assert len(result) == 1
+
+    def test_deduplicates_identical(self):
+        from boris_draft import filter_corrections
+        examples = ["не работи клавишната", "не работи клавишната", "програмата пада"]
+        result = filter_corrections(examples)
+        assert result.count("не работи клавишната") == 1
+
+    def test_tolerates_null_and_empty(self):
+        from boris_draft import filter_corrections
+        result = filter_corrections([None, "", "   ", "не работи"])  # type: ignore
+        assert len(result) == 1
+
+
+class TestSynthesizeRuleWithLlm:
+    """LLM synthesis — happy path и fallback."""
+
+    def _make_judge_fn(self, verdict: str, reason: str) -> MagicMock:
+        mock = MagicMock(return_value={"verdict": verdict, "score": 0.9, "reason": reason})
+        return mock
+
+    def test_llm_happy_path_returns_rule(self):
+        from boris_draft import synthesize_rule_with_llm
+        judge = self._make_judge_fn("junk", "Винаги рестартирай четенето при грешка в AHK")
+        result = synthesize_rule_with_llm(["клавишната не работи"], judge_text_fn=judge)
+        assert result == "Винаги рестартирай четенето при грешка в AHK"
+        judge.assert_called_once()
+
+    def test_llm_unavailable_returns_fallback(self, monkeypatch):
+        """Auto-import path + unavailable transport (returns None) → safe fallback.
+
+        judge_text_fn=None makes synthesize auto-import llm_judge.judge_text; we
+        patch that to return None (deterministically simulating an unavailable
+        Ollama, regardless of whether one is actually running) and assert the
+        safe placeholder is produced rather than a crash or junk.
+        """
+        import llm_judge
+        from boris_draft import synthesize_rule_with_llm
+        monkeypatch.setattr(llm_judge, "judge_text", lambda *a, **k: None, raising=False)
+        result = synthesize_rule_with_llm(["клавишната не работи"], judge_text_fn=None)
+        assert result.startswith("NEEDS HUMAN REWRITE:")
+
+    def test_llm_returns_none_gives_fallback(self):
+        from boris_draft import synthesize_rule_with_llm
+        judge = MagicMock(return_value=None)
+        result = synthesize_rule_with_llm(["терминала се отваря"], judge_text_fn=judge)
+        assert result.startswith("NEEDS HUMAN REWRITE:")
+
+    def test_llm_long_rule_truncated_to_140(self):
+        from boris_draft import synthesize_rule_with_llm
+        long_rule = "Винаги " + "проверявай " * 15  # >140 chars
+        judge = self._make_judge_fn("junk", long_rule)
+        result = synthesize_rule_with_llm(["нещо не работи"], judge_text_fn=judge)
+        assert len(result) <= 140
+
+    def test_llm_result_not_echo_of_example(self):
+        from boris_draft import synthesize_rule_with_llm
+        example = "клавишната комбинация за четене отново не работи"
+        # LLM returns proper rule, not verbatim echo
+        rule = "Проверявай AHK скрипта при стартиране и логвай грешки"
+        judge = self._make_judge_fn("junk", rule)
+        result = synthesize_rule_with_llm([example], judge_text_fn=judge)
+        assert result != example
+
+    def test_no_examples_returns_fallback(self):
+        from boris_draft import synthesize_rule_with_llm
+        judge = MagicMock()
+        result = synthesize_rule_with_llm([], judge_text_fn=judge)
+        assert result.startswith("NEEDS HUMAN REWRITE:")
+        judge.assert_not_called()
+
+    def test_generate_draft_uses_fallback_in_fenced_block(self):
+        """auto_apply reads the fenced block — must never be junk verbatim."""
+        from boris_draft import generate_draft, _extract_proposed_rule
+        # Force LLM unavailable (judge_text_fn=None → import attempt → None fallback)
+        draft = generate_draft(
+            "TestProj",
+            {"count": 4, "examples": ["клавишната не работи", "програмата пада"]},
+            judge_text_fn=MagicMock(return_value=None),
+        )
+        rule = _extract_proposed_rule(draft)
+        assert rule is not None
+        # Must be either a real rule OR the safe fallback marker
+        assert len(rule) <= 140 or rule.startswith("NEEDS HUMAN REWRITE:")
