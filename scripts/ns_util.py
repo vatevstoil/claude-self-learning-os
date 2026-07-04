@@ -33,6 +33,10 @@ _ALIASES = {
     "Petar-Danov": "PetarDanov",
     "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
     "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
+    "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
+    "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
+    "{{PRIVATE_NS}}": "{{PRIVATE_NS}}",
+    "Delo-Zoya": "{{PRIVATE_NS}}",
     "shared": "_shared",
 }
 

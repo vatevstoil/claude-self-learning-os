@@ -108,8 +108,30 @@ class QueueItem:
 _VALUE = {
     "boris_rule": 0.9,
     "promotion": 0.8,
+    "discipline_gap": 0.8,
     "habit": 0.7,
     "graphify": 0.5,
+}
+
+# --- discipline_gap source (weekly discipline_analyzer output → queue) -------
+DISCIPLINE_GAP_MIN_PP = 10.0          # gap vs Fable baseline worth surfacing
+DISCIPLINE_MAX_GAPS_PER_MODEL = 3     # flood cap, largest gaps first
+DISCIPLINE_STATS_DEFAULT = [LOGS_DIR / "discipline_stats.json",
+                            LOGS_DIR / "discipline_stats_opus.json"]
+DISCIPLINE_HISTORY_DEFAULT = LOGS_DIR / "discipline_history.jsonl"
+
+# Higher-is-better metrics → suggested imperative rule text (user-facing, BG).
+# thinking_logging_pct deliberately excluded — structural logging artifact,
+# not a behavior gap. Deliberately duplicated from discipline_analyzer's key
+# set (same precedent as automation_dispatcher.py's task lists).
+_GAP_METRICS = {
+    "reasoning_pct": "Разсъждавай видимо всеки ход: цел + план преди действие",
+    "reason_before_action_pct": "Кажи едноредов план ПРЕДИ първото действие в хода",
+    "reeval_after_result_pct": "След всеки tool резултат преоцени плана преди следващото действие",
+    "read_before_edit_pct": "Прочети точния регион преди да го редактираш",
+    "real_test_after_edit_pct": "Пусни РЕАЛНИЯ тест след edit — не ls/echo",
+    "abs_path_hygiene_pct": "Винаги подавай абсолютни пътища в tool calls — никога relative/cd",
+    "batch_multi_tool_pct": "Групирай независими четения/проверки в един ход",
 }
 
 
@@ -122,15 +144,53 @@ def _load_json(path: Path) -> dict | list:
     return {}
 
 
-def _load_boris(path: Path) -> list[QueueItem]:
+def _load_boris(path: Path, ledger_path: Path | None = None) -> list[QueueItem]:
+    """Load boris candidates, skipping any already applied per the ledger.
+
+    Defense-in-depth belt-and-suspenders: stage3_dreaming.py (the producer)
+    already excludes archived/applied projects from boris-candidates.json, so
+    this check is normally moot. It guards a rebuild against a stale
+    candidates file — mirrors the is_in_ledger usage in boris_draft.py's
+    auto_apply_boris (~line 896). This is a queue-hygiene skip-filter, not a
+    trust gate, so it fails OPEN (keeps the candidate) if trust_tiers or the
+    ledger file is unreadable — trust_tiers' own fail-closed invariant governs
+    APPLY decisions elsewhere, not this dedup check.
+
+    Args:
+        path: Path to boris-candidates.json.
+        ledger_path: Path to applied-ledger.jsonl (tests inject a tmp path;
+            None uses trust_tiers' module default).
+
+    Returns:
+        List of QueueItem for candidates not already recorded as applied.
+    """
     data = _load_json(path)
     if not isinstance(data, dict):
         return []
+
+    # Tolerant import — queue hygiene must never crash if trust_tiers is
+    # temporarily unavailable; simply skip the ledger check (fail-open).
+    _is_in_ledger = None
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        from trust_tiers import is_in_ledger as _is_in_ledger
+    except Exception:
+        _is_in_ledger = None
+
     items = []
     for project, info in (data.get("projects") or {}).items():
         count = info.get("count", 0)
         if count < 2:
             continue
+        item_id = f"boris-{project.lower().replace(' ', '-')[:40]}"
+        if _is_in_ledger is not None:
+            try:
+                ledger_kwargs = {} if ledger_path is None else {"ledger_path": ledger_path}
+                if _is_in_ledger(item_id, **ledger_kwargs):
+                    continue  # already applied — do not resurface
+            except Exception:
+                pass  # fail-open: ledger unreadable, keep the candidate
         confidence = min(0.5 + count * 0.08, 0.95)
         value = _VALUE["boris_rule"]
         examples = info.get("examples", [])
@@ -138,7 +198,7 @@ def _load_boris(path: Path) -> list[QueueItem]:
         if examples:
             desc += f" — e.g. '{examples[0][:80]}'"
         item = QueueItem(
-            id=f"boris-{project.lower().replace(' ', '-')[:40]}",
+            id=item_id,
             type="boris_rule",
             description=desc,
             project=project,
@@ -297,15 +357,101 @@ def _load_promotions(path: Path) -> list[QueueItem]:
     return items
 
 
+def _load_discipline_gaps(
+    stats_paths: list[Path],
+    history_path: Path = DISCIPLINE_HISTORY_DEFAULT,
+) -> list[QueueItem]:
+    """Surface persistent measured discipline gaps as human-gated queue items.
+
+    WIRE, not a generator: discipline_analyzer already measures weekly; this is
+    the missing consumer that turns a persistent gap (>= DISCIPLINE_GAP_MIN_PP
+    vs the Fable baseline in the current stats AND in >= 2 history rows for the
+    same target model — kills one-off blips) into a reviewable suggestion.
+    Items are always "queued": the type has no trust tier, so the fail-closed
+    gate keeps them human-review-only by design (max score 0.72 < 0.85 anyway).
+    """
+    history_rows: list[dict] = []
+    if history_path.exists():
+        try:
+            for line in history_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    history_rows.append(json.loads(line))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    items: list[QueueItem] = []
+    for sp in stats_paths:
+        doc = _load_json(sp)
+        target = (doc or {}).get("target") or {}
+        baseline = (doc or {}).get("baseline") or {}
+        model = target.get("model", "")
+        if not model:
+            continue
+        # Dead/mistyped model pin → analyzer writes sessions=0 and pct(0,0)=0.0
+        # for every metric, which would fabricate ~90pp gaps vs the baseline.
+        if int(target.get("sessions") or 0) < 5:
+            continue
+        model_short = model[len("claude-"):] if model.startswith("claude-") else model
+        rows = [r for r in history_rows if r.get("target") == model]
+        gaps: list[tuple[float, str, str, float, float]] = []
+        for metric, rule in _GAP_METRICS.items():
+            t, b = target.get(metric), baseline.get(metric)
+            if not isinstance(t, (int, float)) or not isinstance(b, (int, float)):
+                continue
+            gap = round(b - t, 1)
+            if gap < DISCIPLINE_GAP_MIN_PP:
+                continue
+            # Count DISTINCT measurement dates, not rows — manual re-runs
+            # append duplicate rows for the same day (5× 06-17 in the live
+            # history), which would satisfy a row-count gate from a single
+            # measurement.
+            persistent_dates = {
+                r.get("date")
+                for r in rows
+                if isinstance((r.get("t") or {}).get(metric), (int, float))
+                and isinstance((r.get("b") or {}).get(metric), (int, float))
+                and (r["b"][metric] - r["t"][metric]) >= DISCIPLINE_GAP_MIN_PP
+            }
+            if len(persistent_dates) < 2:
+                continue
+            gaps.append((gap, metric, rule, float(t), float(b)))
+        gaps.sort(reverse=True)
+        for gap, metric, rule, t, b in gaps[:DISCIPLINE_MAX_GAPS_PER_MODEL]:
+            confidence = round(min(0.5 + gap / 100, 0.9), 3)
+            value = _VALUE["discipline_gap"]
+            items.append(QueueItem(
+                # Stable id (no numbers): same gap → same id every rebuild, so
+                # the suggestion-feedback dismiss filter is the whole dedup.
+                id=f"discipline-{model_short}-{metric}",
+                type="discipline_gap",
+                description=(f"{model}: {metric} {t}% vs Fable {b}% (Δ{gap}pp) — "
+                             f"правило: {rule}"),
+                project="all",
+                confidence=confidence,
+                value=value,
+                score=round(confidence * value, 3),
+                source=str(sp),
+            ))
+    return items
+
+
 def build_queue(
     boris_path: Path = LOGS_DIR / "boris-candidates.json",
     habits_path: Path = LOGS_DIR / "habits.json",
     graphify_path: Path = LOGS_DIR / "graphify-queue.json",
     promotions_path: Path = LOGS_DIR / "promotions-pending.md",
     ledger_path: Path = LOGS_DIR / "habit-ledger.json",
+    applied_ledger_path: Path | None = None,
     carry_judge_path: Path | None = DEFAULT_OUT,
     trust_effectiveness_path: Path | None = None,
     trust_overrides_path: Path | None = None,
+    discipline_stats_paths: list[Path] | None = None,
+    discipline_history_path: Path = DISCIPLINE_HISTORY_DEFAULT,
 ) -> list[QueueItem]:
     """Build a ranked list of self-improvement items from all sources.
 
@@ -320,6 +466,9 @@ def build_queue(
         graphify_path: Path to graphify-queue.json.
         promotions_path: Path to promotions-pending.md.
         ledger_path: Path to habit-ledger.json (graduation status).
+        applied_ledger_path: Path to applied-ledger.jsonl, used by _load_boris
+            to skip candidates already applied (tests inject a tmp path;
+            None uses trust_tiers' module default).
         carry_judge_path: Previously saved queue whose judge_* fields are
             carried over by item id (regeneration must not wipe LLM verdicts).
             None disables carry-over.
@@ -327,15 +476,24 @@ def build_queue(
             (tests inject a tmp path; None uses module default).
         trust_overrides_path: Path override for trust_tiers.get_tier
             (tests inject a tmp path; None uses module default).
+        discipline_stats_paths: discipline_stats*.json files for the
+            discipline_gap source. None DISABLES the source (opt-in: keeps the
+            ~30 existing build_queue test call sites isolated from the real
+            logs dir). Production call sites pass DISCIPLINE_STATS_DEFAULT.
+        discipline_history_path: discipline_history.jsonl for the
+            persistence gate.
 
     Returns:
         List of QueueItem sorted by score descending.
     """
     items: list[QueueItem] = []
-    items.extend(_load_boris(boris_path))
+    items.extend(_load_boris(boris_path, ledger_path=applied_ledger_path))
     items.extend(_load_habits(habits_path, ledger_path=ledger_path))
     items.extend(_load_graphify(graphify_path))
     items.extend(_load_promotions(promotions_path))
+    if discipline_stats_paths:
+        items.extend(_load_discipline_gaps(discipline_stats_paths,
+                                           history_path=discipline_history_path))
 
     # Judge verdicts live only in the saved queue file; a rebuild from sources
     # would silently discard them, so llm_judge work survives regeneration.
@@ -361,6 +519,21 @@ def build_queue(
                 it.judge_score = old.get("judge_score", 0.0)
 
         # Items the LLM judge already ruled "junk" must not resurface on rebuild.
+        # The filter below deletes them from the very file carry reads, so for
+        # regenerating sources with stable ids (discipline_gap rebuilds from
+        # stats every run) the verdict would survive exactly ONE rebuild and
+        # the item would return unscored, burning judge budget forever.
+        # Persist the veto as a machine dismissal before dropping.
+        _junk = [it for it in items if it.judge_verdict == "junk"]
+        if _junk:
+            try:
+                from suggestion_feedback import dismiss as _sf_dismiss
+                from suggestion_feedback import is_suppressed as _sf_sup
+                for it in _junk:
+                    if not _sf_sup(it.id, path=_FEEDBACK_PATH):
+                        _sf_dismiss(it.id, weeks=12, path=_FEEDBACK_PATH)
+            except Exception:
+                pass
         items = [it for it in items if it.judge_verdict != "junk"]
 
     # Tier gate: auto_apply requires trust tier >= 1.
@@ -482,7 +655,8 @@ def main() -> None:
              "Output goes to stdout; queue is still saved in full.",
     )
     args = p.parse_args()
-    items = build_queue(carry_judge_path=Path(args.out))
+    items = build_queue(carry_judge_path=Path(args.out),
+                        discipline_stats_paths=DISCIPLINE_STATS_DEFAULT)
     save_queue(items, path=Path(args.out))
     auto = sum(1 for i in items if i.status == "auto_apply")
     print(f"[queue] {len(items)} items ({auto} auto_apply) -> {args.out}", file=sys.stderr)

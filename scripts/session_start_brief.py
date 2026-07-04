@@ -133,6 +133,8 @@ def _format_queue_item(item: object) -> str | None:
         return f"🔁 {desc[:120]}"
     elif item_type == "graphify":
         return f"🧠 {desc}"
+    elif item_type == "discipline_gap":
+        return f"🧭 Дисциплина: {desc[:140]}"
     return None
 
 
@@ -181,14 +183,21 @@ def main() -> None:
     # --- Unified queue: top-2 queued items for this project ---
     _queue_ok = False
     try:
-        from self_improvement_queue import build_queue, filter_for_project  # type: ignore
+        from self_improvement_queue import (  # type: ignore
+            DISCIPLINE_STATS_DEFAULT, build_queue, filter_for_project)
 
-        all_items = build_queue()
+        all_items = build_queue(discipline_stats_paths=DISCIPLINE_STATS_DEFAULT)
         project_items = filter_for_project(all_items, project or "")
         queued = [i for i in project_items if i.status == "queued"]
-        for item in queued[:2]:
+        # Fill the 2 slots with FORMATABLE items — an unformatable type must
+        # not silently eat a slot (starves everything ranked below it).
+        shown = 0
+        for item in queued:
+            if shown >= 2:
+                break
             msg = _format_queue_item(item)
             if msg:
+                shown += 1
                 alerts.append(msg)
                 # Track implicit feedback — auto-suppress after 5 unacknowledged surfaces
                 try:
@@ -305,8 +314,26 @@ def main() -> None:
 
                 # (b) cross-project layers — surface top high-signal lessons
                 # bge-m3 cosine scores run lower than e5's — calibrate the
-                # high-signal threshold per backend (e5≈0.82, bge-m3≈0.60).
-                _XTHRESH = 0.60 if _lr is not None else 0.82
+                # high-signal threshold per backend (e5≈0.82, bge-m3≈0.66).
+                # Raised 0.60→0.66 (2026-06-24): at 0.60 engagement was 2.1%
+                # (avg surfaced score 0.74; higgsfield alone dumped 90 surfaced
+                # / 0 engaged — pure noise). 0.66 trims the low-signal tail
+                # without silencing surfacing. Re-tune from
+                # cross-recall-metrics.json (avg_score/per_project) if it drifts.
+                _XTHRESH = 0.66 if _lr is not None else 0.82
+                # Per-project suppression decay: a project chronically surfaced
+                # with zero engagement (e.g. higgsfield.ai: 90 surfaced / 0
+                # engaged) gets a higher bar next time. Self-correcting — the
+                # moment cross_recall_metrics.py sees an engagement for this
+                # project, per_project["engaged"] > 0 and the bump drops to 0.
+                # Fail-open: any error or missing metrics file → no bump.
+                try:
+                    from cross_recall_metrics import project_threshold_bump as _bump_fn
+                    _metrics_path = LOGS / "cross-recall-metrics.json"
+                    _metrics = json.loads(_metrics_path.read_text(encoding="utf-8"))
+                    _XTHRESH += _bump_fn(_metrics, project)
+                except Exception:
+                    pass
                 # Only surface meaningful types — raw_passage and typeless chunks
                 # are bulk corpus noise and must not crowd out actual lessons.
                 _MEANINGFUL_TYPES = frozenset({

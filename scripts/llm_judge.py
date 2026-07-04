@@ -53,9 +53,20 @@ TOOL_TOKENS: frozenset[str] = frozenset(
         "javascripttool", "for", "until", "while", "rm", "cp", "mv", "mkdir",
         "pwd", "sleep", "export", "program", "curl", "wget", "exitplanmode",
         "enterplanmode", "websearch", "webfetch", "wait", "explore",
+        "tabscontextmcp", "previewstart", "previewstop", "previewresize",
         # Multi-word agent/role tokens that contain '-' themselves:
         "general-purp", "code-reviewe", "python-pro", "frontend-dev",
         "backend-arch",
+        # NOTE: bare "security-aud" was tried on 07-01 and reverted here —
+        # it collided with the "security-aud-code-reviewe" real-agent-combo
+        # test fixture (tests/test_integrity_guard.py); no junk draft on
+        # disk currently needs it as a standalone token.
+        # 'monitor'/'workflow'/'handoff'/'cd'/'wc' are bare generic words that
+        # collide with real skill slugs (monitor-tool, agent-team-workflow,
+        # workflow-orchestrator, handoff) when used as standalone tokens, so
+        # they are only tool-tokens in these specific self-referential
+        # tool-call compounds (greedy matcher supports hyphenated tokens):
+        "cd-edit", "monitor-powershell", "workflow-read", "handoff-python",
     ]
 )
 
@@ -138,27 +149,29 @@ _SYSTEM_PROMPT_QUEUE = (
 )
 
 
-def judge_text(
+def call_ollama_raw(
     system_prompt: str,
     user_text: str,
     model: str | None = None,
     base_url: str = "http://localhost:11434/v1",
     timeout: int = 60,
-) -> dict[str, Any] | None:
-    """Call Ollama /v1/chat/completions and parse the JSON verdict.
+) -> str | None:
+    """Call Ollama /v1/chat/completions and return the raw content string.
 
     Never raises.  Returns None on any error (connection, timeout, bad JSON).
+    Unlike judge_text, does NOT require/parse a {verdict: useful|junk} shape —
+    use this for callers that want free-text LLM output (e.g. rule synthesis).
 
     Args:
-        system_prompt: The judge instruction prompt.
-        user_text: The content to evaluate.
+        system_prompt: The instruction prompt.
+        user_text: The content to send.
         model: Model name. Falls back to ``LLM_JUDGE_MODEL`` env var, then
             ``"gemma4:hermes"``.
         base_url: Ollama base URL.
         timeout: HTTP timeout in seconds.
 
     Returns:
-        Dict with keys ``verdict``, ``score``, ``reason`` or None on failure.
+        Raw response content string, or None on failure.
     """
     if model is None:
         model = os.environ.get("LLM_JUDGE_MODEL", "gemma4:hermes")
@@ -192,6 +205,37 @@ def judge_text(
         data = json.loads(raw)
         content: str = data["choices"][0]["message"]["content"]
     except Exception:
+        return None
+
+    return content
+
+
+def judge_text(
+    system_prompt: str,
+    user_text: str,
+    model: str | None = None,
+    base_url: str = "http://localhost:11434/v1",
+    timeout: int = 60,
+) -> dict[str, Any] | None:
+    """Call Ollama /v1/chat/completions and parse the JSON verdict.
+
+    Never raises.  Returns None on any error (connection, timeout, bad JSON).
+
+    Args:
+        system_prompt: The judge instruction prompt.
+        user_text: The content to evaluate.
+        model: Model name. Falls back to ``LLM_JUDGE_MODEL`` env var, then
+            ``"gemma4:hermes"``.
+        base_url: Ollama base URL.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        Dict with keys ``verdict``, ``score``, ``reason`` or None on failure.
+    """
+    content = call_ollama_raw(
+        system_prompt, user_text, model=model, base_url=base_url, timeout=timeout
+    )
+    if content is None:
         return None
 
     return _parse_verdict(content)

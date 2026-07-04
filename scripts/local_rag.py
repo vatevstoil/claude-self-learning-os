@@ -162,14 +162,27 @@ def upsert_vec(ns: str, vid: str, vec: list, text: str, meta: dict | None = None
         c.close()
 
 
+def guard_reason(text: str) -> str | None:
+    """Name of the ingest guard that blocks `text` ('secret' / 'pii'), or None.
+
+    Single source of truth for upsert()'s gate, so callers (pinecone.py save) can
+    report WHICH guard refused a save without ever echoing the text itself."""
+    if contains_secret(text or ""):
+        return "secret"
+    if _blocks_pii(text or ""):
+        return "pii"
+    return None
+
+
 def upsert(ns: str, vid: str, text: str, meta: dict | None = None) -> bool:
     """Embed `text` locally (bge-m3) and store it. Returns False (skipped) if the
     text contains a detected secret — never persists credentials to the plaintext
     sqlite store."""
-    if contains_secret(text):
+    reason = guard_reason(text)
+    if reason == "secret":
         print(f"  [secret] SKIP {ns}/{vid} — credential-like content not stored", file=sys.stderr)
         return False
-    if _blocks_pii(text):
+    if reason == "pii":
         print(f"  [pii] SKIP {ns}/{vid} — personal data (EGN/card/IBAN/legal) not stored", file=sys.stderr)
         return False
     # timeout=6: Ollama slow → socket.timeout → PineconeError → cmd_save queues to
@@ -180,16 +193,33 @@ def upsert(ns: str, vid: str, text: str, meta: dict | None = None) -> bool:
 
 def upsert_many(rows: list) -> int:
     """Store many pre-embedded records in one transaction.
-    rows = list of (ns, id, vec, text, meta_dict). Returns count."""
+    rows = list of (ns, id, vec, text, meta_dict). Returns count STORED.
+
+    Applies the SAME secret + PII gates as upsert()/upsert_vec() at the storage
+    layer, so bulk paths (e.g. migrate_pinecone_to_local) cannot bypass the guard:
+    a row whose text looks like a credential or carries blocked PII is skipped
+    (never written to the plaintext store), not silently bulk-inserted."""
+    safe_rows = []
+    for (ns, vid, vec, text, meta) in rows:
+        t = text or ""
+        if contains_secret(t):
+            print(f"  [secret] SKIP {ns}/{vid} — credential-like content not stored", file=sys.stderr)
+            continue
+        if _blocks_pii(t):
+            print(f"  [pii] SKIP {ns}/{vid} — blocked PII not stored", file=sys.stderr)
+            continue
+        safe_rows.append((ns, vid, vec, text, meta))
+    if not safe_rows:
+        return 0
     c = _conn()
     try:
         c.executemany(
             "INSERT OR REPLACE INTO vectors (ns,id,text,meta,vec) VALUES (?,?,?,?,?)",
             [(ns, vid, (text or "")[:2000], json.dumps(meta or {}, ensure_ascii=False), _normalize(vec))
-             for (ns, vid, vec, text, meta) in rows],
+             for (ns, vid, vec, text, meta) in safe_rows],
         )
         c.commit()
-        return len(rows)
+        return len(safe_rows)
     finally:
         c.close()
 

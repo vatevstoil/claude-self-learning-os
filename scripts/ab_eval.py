@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -155,7 +156,9 @@ def _project_from_target_file(target_file: str) -> str:
     """Extract a normalised project key from a ``target_file`` path string.
 
     Strategy: take the parent directory name of the target file and normalise
-    to lowercase with hyphens, mirroring how incident_tracker stores project keys.
+    to lowercase. NOTE: this yields a directory basename ("facturka.bg"), NOT
+    the cwd-slug form incident_tracker uses as cluster keys
+    ("j--antigraviti-facturka-bg") — it is a last-resort fallback only.
 
     Args:
         target_file: Absolute path string to a CLAUDE.md or similar file.
@@ -168,6 +171,47 @@ def _project_from_target_file(target_file: str) -> str:
     p = Path(target_file)
     # CLAUDE.md lives at <project_root>/CLAUDE.md; parent is the project root.
     return p.parent.name.lower()
+
+
+def _project_from_entry(entry: dict[str, Any]) -> str:
+    """Derive the project key for a ledger entry, tolerating backfilled rows.
+
+    Some ledger entries (e.g. ``source: backfill_review_verdicts``) carry a
+    human-readable placeholder in ``target_file`` (not a real path), such as
+    ``"(backfilled from review-verdicts 2026-06-11)"``. In that case
+    ``_project_from_target_file`` cannot recover a project key (no path
+    separator to parse), which previously produced an empty project string
+    and starved the project-scoped cluster match.
+
+    Fallback: derive the project from ``item_id`` instead, which encodes it
+    as ``<type>-<project>`` (e.g. ``"boris-j--antigraviti-facturka-bg"`` or
+    ``"habit-j--antigraviti-higgsfield-ai-powershell-read"``). We strip the
+    leading type token (the segment before the first ``-``) and keep the rest.
+
+    Args:
+        entry: One row from ``applied-ledger.jsonl``.
+
+    Returns:
+        Normalised project key string (may be empty if nothing parseable).
+    """
+    item_id = entry.get("item_id", "")
+    # Real auto-applied rows encode the project as a cwd slug (contains "--",
+    # e.g. "auto-boris-j--antigraviti-facturka-bg") — the ONLY form that
+    # matches incident_tracker cluster keys. A target_file path yields just a
+    # directory basename ("facturka.bg") that never prefix-matches those keys,
+    # so the slug must win over the path branch when both are present.
+    m = re.search(r"[a-z0-9]+--[a-z0-9._-]+", item_id.lower())
+    if m:
+        return m.group(0)
+
+    target_file = entry.get("target_file", "")
+    if "/" in target_file or "\\" in target_file:
+        return _project_from_target_file(target_file)
+
+    if "-" not in item_id:
+        return ""
+    _prefix, rest = item_id.split("-", 1)
+    return rest.lower()
 
 
 def load_ledger_tolerant(ledger_path: Path) -> list[dict[str, Any]]:
@@ -250,7 +294,14 @@ def find_matching_cluster(
     for scoped in (True, False):
         for cluster in clusters:
             cluster_project = cluster.get("project", "").lower()
-            if scoped and cluster_project != rule_project:
+            # ponytail: prefix match (not exact equality) because item_id-derived
+            # rule_project can carry a routine/habit suffix the cluster's project
+            # key lacks (e.g. "...higgsfield-ai-powershell-read" vs
+            # "...higgsfield-ai"). Guarded so an empty key on either side never
+            # matches. Ceiling: two sibling projects sharing a name prefix can
+            # collide (e.g. "foo" vs "foo-bar"); upgrade path = an explicit
+            # project key field on future ledger rows instead of derived prefix.
+            if scoped and (not cluster_project or not rule_project.startswith(cluster_project)):
                 continue
 
             # Build candidate text: representative + examples
@@ -358,7 +409,7 @@ def evaluate_rule(
             "item_id": item_id,
             "item_type": item_type,
             "ts_applied": ts_raw,
-            "project": _project_from_target_file(entry.get("target_file", "")),
+            "project": _project_from_entry(entry),
             "cluster_id": None,
             "before_rate": None,
             "after_rate": None,
@@ -368,7 +419,7 @@ def evaluate_rule(
             "note": "Could not parse application timestamp; skipped.",
         }
 
-    project = _project_from_target_file(entry.get("target_file", ""))
+    project = _project_from_entry(entry)
     rule_tokens = normalize(_rule_text(entry))
     cluster = find_matching_cluster(project, rule_tokens, clusters)
 

@@ -200,7 +200,7 @@ def build_metadata(content: str, last_user: str, session_id: str, project: str, 
         "session_id": session_id[:8] if session_id else "",
         "tokens": len(content) // 4,
         "ttl_days": ttl,
-        "source_model": source_model[:30] if source_model else "",  # e.g., "claude-opus-4-7"
+        "source_model": source_model[:30] if source_model else "",  # e.g., "claude-opus-4-8"
     }
 
 

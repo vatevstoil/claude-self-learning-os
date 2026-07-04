@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 SKILLS_DIR = Path.home() / ".claude" / "skills"
@@ -190,6 +193,12 @@ def analyze_jsonl_files(days: int):
     prompt_count = 0
     correction_examples = []
     corrections_by_project = defaultdict(list)  # Boris: per-project correction texts
+    # Slug collision guard: lossy Cyrillic->dash slugification can map two
+    # DIFFERENT real project dirs to the identical slug (e.g. "{{PRIVATE_NS}}"
+    # and "{{PRIVATE_NS}}" both -> "J--Obsidian-Resurch---------------").
+    # Track distinct real cwd values seen per slug; if >1 distinct cwd maps
+    # to the same slug, refuse to merge their corrections (see guard below).
+    slug_cwds = defaultdict(set)  # project_name -> set of distinct rec['cwd']
     # Cost / session signals
     usage_by_model = defaultdict(lambda: defaultdict(int))   # family -> usage totals
     session_peak = defaultdict(int)                           # sessionId -> peak context size (1 turn)
@@ -219,6 +228,10 @@ def analyze_jsonl_files(days: int):
                             rec = json.loads(line)
                         except Exception:
                             continue
+
+                        rec_cwd = rec.get("cwd")
+                        if rec_cwd:
+                            slug_cwds[project_name].add(rec_cwd)
 
                         # Filter by record timestamp if present
                         ts = parse_timestamp(rec.get("timestamp", ""))
@@ -310,6 +323,31 @@ def analyze_jsonl_files(days: int):
                                 corrections_by_project[project_name].append(text[:160])
             except Exception:
                 continue
+
+    # Refuse-on-ambiguity: drop corrections for any slug produced by LOSSY
+    # non-ASCII slugification (a long run of consecutive dashes — every
+    # Cyrillic/non-alnum char collapses to '-') that also collides multiple
+    # distinct real project roots. Real ASCII project slugs never have long
+    # dash runs (only the "J--" drive prefix, max run = 2); a run of >=4
+    # dashes is the actual lossy-encoding signature this guard targets (same
+    # philosophy as boris_draft._resolve_real_project_dir — never guess
+    # wrong). Scoping to this signature avoids false positives from ordinary
+    # subagent/orchestrator cwd noise on normal ASCII-named projects, where
+    # "multiple distinct roots under one slug" is common and NOT a privacy
+    # collision (e.g. repo root + backend/ + a stray subagent cwd).
+    _LOSSY_SLUG_RE = re.compile(r"-{4,}")
+    for slug, cwds in slug_cwds.items():
+        if len(cwds) <= 1 or slug not in corrections_by_project:
+            continue
+        if not _LOSSY_SLUG_RE.search(slug):
+            continue
+        log.warning(
+            "stage3_dreaming: lossy-encoded slug %r collides %d distinct "
+            "project roots (%s) — dropping its corrections bucket to avoid "
+            "mixing private-namespace text across projects",
+            slug, len(cwds), ", ".join(sorted(cwds)),
+        )
+        del corrections_by_project[slug]
 
     return {
         "term_counter": term_counter,
@@ -696,13 +734,26 @@ def main():
     # Boris semi-automation: write per-project correction→rule candidates.
     # SessionStart surfaces these for the relevant project so the correction→
     # CLAUDE.md-rule loop gets a nudge instead of relying on memory.
+    #
+    # Drainage guard: this dict is rebuilt FROM SCRATCH every run purely from
+    # the current window's corrections, with no applied-state awareness, so a
+    # project whose correction was already reviewed/applied would resurface
+    # forever. Reuse the archived-drafts folder (human-reviewed drafts get
+    # moved there — see logs/boris-drafts/archived/) as the drained-signal:
+    # if a project's draft was already archived, skip re-emitting it here.
     try:
+        archived_dir = LOGS_DIR / "boris-drafts" / "archived"
+        archived_stems = set()
+        if archived_dir.is_dir():
+            archived_stems = {p.stem for p in archived_dir.glob("*.md")}
+
         cbp = data.get("corrections_by_project", {})
         boris = {
             "generated": datetime.now().isoformat(timespec="seconds"),
             "window_days": args.days,
             "projects": {p: {"count": len(ex), "examples": ex[:5]}
-                         for p, ex in cbp.items() if len(ex) >= 2},
+                         for p, ex in cbp.items()
+                         if len(ex) >= 2 and re.sub(r'[<>:"/\\|?*]', "_", p) not in archived_stems},
         }
         (REPORTS_DIR.parent / "logs" / "boris-candidates.json").write_text(
             json.dumps(boris, ensure_ascii=False, indent=2), encoding="utf-8")

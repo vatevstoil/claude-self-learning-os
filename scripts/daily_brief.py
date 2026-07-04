@@ -33,6 +33,7 @@ except Exception:
 
 HOME = Path.home()
 LOGS = HOME / ".claude" / "logs"
+SKILLS = HOME / ".claude" / "skills"
 OUT = Path(r"{{WIKI_PATH}}\_meta\daily-brief.md")
 OPEN_NOTES_LOG = LOGS / "open-notes.jsonl"
 
@@ -46,6 +47,71 @@ def _load_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _growth_pulses() -> list[dict]:
+    """One entry per project that has a GROWTH_NEXT_STEPS.md (written by /growth).
+
+    Self-contained: reads the growth-loop config to find each project's output
+    file; silent if the config or artifacts are absent (an unrun loop shows
+    nothing rather than a stale claim). Returns dicts: name, week_of, actions,
+    verdict, path.
+    """
+    cfg = _load_json(SKILLS / "growth-loop" / "projects.json", {})
+    projects = (cfg or {}).get("projects", {})
+    if not isinstance(projects, dict):
+        return []
+    # CHECK-beat eval history per project (loop-engineering verifiable gate, written
+    # by growth_runner._write_eval). Append-only chronological. We keep the full
+    # history per project so we can surface both the latest verdict AND a sustained
+    # regression (the eval-before-promote signal: a loop degrading over weeks).
+    check_hist: dict[str, list] = {}
+    try:
+        for line in (LOGS / "growth-eval.jsonl").read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("project"):
+                check_hist.setdefault(rec["project"], []).append(rec)
+    except Exception:
+        pass
+    out: list[dict] = []
+    for key, p in projects.items():
+        outfile = (p or {}).get("output")
+        if not outfile:
+            continue
+        try:
+            text = Path(outfile).read_text(encoding="utf-8")
+        except Exception:
+            continue
+        wk = re.search(r"week_of:\s*([0-9-]+)", text)
+        # verdict: prefer frontmatter (what the runner writes), fall back to a header
+        verdict = re.search(r"(?m)^verdict:\s*(.+)$", text) or re.search(r"##\s*Verdict:\s*(.+)", text)
+        # ranked actions are table rows "| <n> |" (same regex as growth_runner CHECK beat)
+        actions = len(re.findall(r"(?m)^\|\s*\d+\s*\|", text))
+        hist = check_hist.get(key, [])
+        chk = hist[-1] if hist else {}
+        # Sustained regression: the last >=2 runs both failed to cleanly PASS.
+        last_verdicts = [r.get("verdict") for r in hist[-3:]]
+        recent = [v for v in last_verdicts if v]
+        regressed = len(recent) >= 2 and all(v != "PASS" for v in recent[-2:])
+        out.append({
+            "name": (p or {}).get("display_name", key),
+            "week_of": wk.group(1) if wk else "?",
+            "actions": actions,
+            "verdict": (verdict.group(1).strip() if verdict else "")[:90],
+            "check_verdict": chk.get("verdict", ""),
+            "check_score": chk.get("score"),
+            "check_issues": chk.get("issues") or [],
+            "check_regressed": regressed,
+            "check_trend": recent,
+            "path": outfile,
+        })
+    return out
 
 
 def extract_open_notes(text: str) -> list[str]:
@@ -110,8 +176,8 @@ def _short_id(item_id: str) -> str:
 def _item_type_from_id(item_id: str) -> str:
     """Infer item_type from item id prefix for the accept command.
 
-    Covers the four known prefixes produced by self_improvement_queue:
-    boris-, habit-, promo-, graphify-.  Falls back to empty string.
+    Covers the known prefixes produced by self_improvement_queue:
+    boris-, habit-, promo-, graphify-, discipline-.  Falls back to empty string.
 
     Args:
         item_id: Queue item identifier string.
@@ -127,12 +193,15 @@ def _item_type_from_id(item_id: str) -> str:
         return "promotion"
     if item_id.startswith("graphify-"):
         return "graphify"
+    if item_id.startswith("discipline-"):
+        return "discipline_gap"
     return ""
 
 
 def build_brief(now: datetime, health: dict, stale: list, priorities: list[str],
                 anticipations: dict, queue_depth: int, carried_notes: list[str],
-                *, incidents: list | None = None, kpi: dict | None = None,
+                *, incidents: list | None = None, silenced_count: int = 0,
+                kpi: dict | None = None,
                 escalation: dict | None = None,
                 auto_applied: list | None = None,
                 review_items: list | None = None,
@@ -161,6 +230,12 @@ def build_brief(now: datetime, health: dict, stale: list, priorities: list[str],
             lines.append(f"- **{_proj_short(inc.get('project', '?'))}** "
                          f"×{inc.get('count', '?')} (от {str(inc.get('first_seen', '?'))[:10]}): "
                          f"{inc.get('title', '')}")
+
+    # "resolution: silence" means the signal stopped, NOT that anyone fixed it —
+    # rendered even with zero open incidents (that combination IS the blind spot).
+    if silenced_count:
+        lines.append(f"- 🤫 {silenced_count} инцидент(а) затворени по замлъкване (без потвърден fix) — "
+                     f"провери реално ли са решени: `python ~/.claude/scripts/incident_tracker.py`")
 
     # Drafted, human-gated fix sessions awaiting approval (never auto-run).
     if fix_proposals:
@@ -211,6 +286,21 @@ def build_brief(now: datetime, health: dict, stale: list, priorities: list[str],
         mark = "✅ оздравено" if ok else "❌ НЕУСПЕШНО — нужна ръчна намеса"
         lines.append(f"- 🛠 Самолечение: {escalation.get('action', '?')} → {mark} "
                      f"({str(escalation.get('ts', ''))[:16]})")
+    # Hermes agent liveness — read-only pulse written by the dispatcher before this
+    # brief runs. A down gateway is surfaced here (visible), never silently dark.
+    try:
+        _hp = json.loads((HOME / ".claude" / "logs" / "hermes_pulse.json")
+                         .read_text(encoding="utf-8"))
+    except Exception:
+        _hp = None
+    if _hp:
+        _hg = _hp.get("gateway", "unknown")
+        if _hg == "running":
+            lines.append(f"- 🤖 Hermes: ✓ (Telegram: {_hp.get('telegram', '?')})")
+        elif _hg == "stopped":
+            lines.append("- 🤖 Hermes: ⚠️ gateway СПРЯН — стартирай `Hermes.lnk` или tray ▶ Start")
+        else:
+            lines.append("- 🤖 Hermes: ❓ pulse неясен (виж ~/.claude/logs/hermes_pulse.json)")
     if stale:
         names = ", ".join((s.get("project", "?") if isinstance(s, dict) else str(s)) for s in stale)
         lines.append(f"- Stale графи: {names}")
@@ -222,6 +312,9 @@ def build_brief(now: datetime, health: dict, stale: list, priorities: list[str],
     err = issues.get("errors") if isinstance(issues, dict) else None
     if err:
         lines.append(f"- Errors: {'; '.join(err)[:160]}")
+    hook_iss = issues.get("hooks") if isinstance(issues, dict) else None
+    if hook_iss:
+        lines.append(f"- Hook здраве: {'; '.join(hook_iss)[:160]}")
     # Stale human-review queues (queue_aging weekly DRY report).
     stale_q = (aging or {}).get("stale") or []
     if stale_q:
@@ -267,6 +360,78 @@ def build_brief(now: datetime, health: dict, stale: list, priorities: list[str],
         lines.append(f"- Фуния: {af.get('applied_30d', 0)} приложени (30d) · "
                      f"{af.get('queue_depth', '?')} в опашка · "
                      f"{af.get('open_incidents', 0)} отворени инцидента")
+
+    # 🧭 Discipline pulse — Fable-mindset measured habits, refreshed weekly by the
+    # dispatcher (discipline_analyzer → discipline_stats.json). Self-contained:
+    # renders only when the stats file exists, so an unwired/failed loop shows nothing.
+    disc = _load_json(LOGS / "discipline_stats.json", {})
+    dt = (disc or {}).get("target") or {}
+    db = (disc or {}).get("baseline") or {}
+    if dt.get("model"):
+        lines += ["", "## 🧭 Дисциплина (Fable-mindset)"]
+        lines.append(
+            f"- **{dt.get('model', '?')}** vs {db.get('model', '?')}: "
+            f"reason>act {dt.get('reason_before_action_pct', '?')}% · "
+            f"read>edit {dt.get('read_before_edit_pct', '?')}% · "
+            f"test>edit {dt.get('real_test_after_edit_pct', '?')}% · "
+            f"abs-path {dt.get('abs_path_hygiene_pct', '?')}%")
+        tte = dt.get("real_test_after_edit_pct")
+        if isinstance(tte, (int, float)) and tte < 50:
+            lines.append("  ↳ test>edit под 50% — пусни реалния тест след edit "
+                         "(виж `/mindset wire`)")
+
+    # 🔄 Dreaming loop verdict — Loop-Engineering memory between cycles. The
+    # dreaming run writes dreaming-next-steps.json (verdict + open arcs); the
+    # brief surfaces "iterate" so a degraded self-improvement loop is visible in
+    # the morning, not only in health.json. Self-contained: silent if no file.
+    dns = _load_json(LOGS / "dreaming-next-steps.json", {})
+    if (dns or {}).get("verdict") == "iterate":
+        arcs = ", ".join(dns.get("open_arcs") or []) or "—"
+        lines += ["", "## 🔄 Dreaming цикъл"]
+        lines.append(
+            f"- **iterate** — {dns.get('steps_failed', '?')}/{dns.get('steps_total', '?')} "
+            f"стъпки паднаха (арки: {arcs}) → виж `logs/automation.log` + `health.json`")
+
+    # 📈 Growth loops — weekly /growth output per project. Self-contained: renders
+    # only for projects whose GROWTH_NEXT_STEPS.md exists. Flags a stale week.
+    growth = _growth_pulses()
+    if growth:
+        lines += ["", "## 📈 Growth loops"]
+        for g in growth:
+            stale = ""
+            try:
+                wk = datetime.strptime(g["week_of"], "%Y-%m-%d").date()
+                if (now.date() - wk).days > 9:
+                    stale = " ⚠️ остаряло — пусни `/growth`"
+            except Exception:
+                pass
+            # CHECK-beat quality flag — surface a degraded/failed loop run.
+            cv = g.get("check_verdict")
+            cflag = ""
+            if cv == "FAIL":
+                cflag = " 🔴 CHECK FAIL — изходът е негоден, пусни наново"
+            elif cv == "WEAK":
+                iss = "; ".join(g.get("check_issues") or []) or "деградиран"
+                cflag = f" 🟡 CHECK WEAK ({g.get('check_score')}) — {iss}"
+            # Sustained regression across runs — the eval-before-promote alarm.
+            if g.get("check_regressed"):
+                cflag += (f" ⛔ РЕГРЕСИЯ — тренд {'/'.join(g.get('check_trend') or [])} "
+                          f"(последни 2 не са PASS) → ревизирай loop-а")
+            lines.append(
+                f"- **{g['name']}** (седмица {g['week_of']}): {g['actions']} действия — "
+                f"{g['verdict']}{stale}{cflag}")
+            lines.append(f"  → `{g['path']}`")
+
+    # 🧪 A/B counterfactual — surface regressed / no-effect auto-rules so the causal
+    # verdict reaches the morning brief (not only the manually-opened dashboard).
+    abev = _load_json(LOGS / "ab-eval.json", {})
+    absum = (abev or {}).get("summary") or {}
+    if (absum.get("decided") or 0) > 0 and ((absum.get("regressed") or 0) or (absum.get("no_effect") or 0)):
+        lines += ["", "## 🧪 A/B на правилата (каузален ефект)"]
+        lines.append(
+            f"- {absum.get('regressed', 0)} регресирали · {absum.get('no_effect', 0)} без ефект · "
+            f"{absum.get('effective', 0)} ефективни (от {absum.get('decided', 0)} решени) → "
+            f"преглед: `python ~/.claude/scripts/ab_eval.py`")
 
     # Auto-applied items awaiting human glance (Tier 1 notifications).
     if auto_applied:
@@ -376,7 +541,10 @@ def main() -> None:
     if pend.exists():
         queue_depth = len([l for l in pend.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()])
 
-    incidents = (_load_json(LOGS / "incidents.json", {}) or {}).get("open", [])
+    incidents_doc = _load_json(LOGS / "incidents.json", {}) or {}
+    incidents = incidents_doc.get("open", [])
+    silenced = sum(1 for r in (incidents_doc.get("resolved_recent") or [])
+                   if isinstance(r, dict) and r.get("resolution") == "silence")
     fix_proposals = [p for p in (_load_json(LOGS / "fix-proposals.json", {}) or {}).get("proposals", [])
                      if isinstance(p, dict) and p.get("status") == "proposed"]
     kpi = _load_json(LOGS / "outcome-kpi.json", {}) or None
@@ -443,7 +611,8 @@ def main() -> None:
         pass
 
     md = build_brief(now, health, stale, priorities, anticipations, queue_depth, carried,
-                     incidents=incidents, kpi=kpi, escalation=escalation,
+                     incidents=incidents, silenced_count=silenced,
+                     kpi=kpi, escalation=escalation,
                      auto_applied=auto_applied, review_items=review_items,
                      fix_proposals=fix_proposals, aging=aging,
                      skills_audit=skills_audit, integrity=integrity, doctor=doctor,

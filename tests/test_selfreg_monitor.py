@@ -204,6 +204,58 @@ def test_check_errors_timeout_cleared_by_success(tmp_path, monkeypatch) -> None:
     assert score == 100 or not any("slow_script.py" in i for i in issues)
 
 
+def test_check_errors_stale_oneoff_error_cleared(tmp_path, monkeypatch) -> None:
+    """A single [ERROR] from days ago that never recurs → stale → not counted.
+    Regression guard for the false-positive that pinned the grade at 86."""
+    import selfreg_monitor as sm
+
+    now = datetime(2026, 6, 10, 12, 0, 0)
+    log = f"{_ts(now - timedelta(days=4))},000 [ERROR] write_dreaming_next_steps failed: boom"
+    monkeypatch.setattr(sm, "PENDING_SAVES", tmp_path / "no-saves.jsonl")
+    score, issues = sm.check_errors(log, now=now)
+    assert score == 100
+    assert issues == []
+
+
+def test_check_errors_recurring_error_surfaced(tmp_path, monkeypatch) -> None:
+    """The same [ERROR] seen more than once in-window → recurring → surfaced."""
+    import selfreg_monitor as sm
+
+    now = datetime(2026, 6, 10, 12, 0, 0)
+    log = "\n".join([
+        f"{_ts(now - timedelta(days=4))},000 [ERROR] widget pipeline failed: boom",
+        f"{_ts(now - timedelta(days=3))},000 [ERROR] widget pipeline failed: boom",
+    ])
+    monkeypatch.setattr(sm, "PENDING_SAVES", tmp_path / "no-saves.jsonl")
+    score, issues = sm.check_errors(log, now=now)
+    assert score < 100
+    assert any("widget pipeline failed" in i for i in issues)
+
+
+def test_check_errors_recent_error_surfaced(tmp_path, monkeypatch) -> None:
+    """A one-off [ERROR] within the recent horizon → surfaced (not yet stale)."""
+    import selfreg_monitor as sm
+
+    now = datetime(2026, 6, 10, 12, 0, 0)
+    log = f"{_ts(now - timedelta(hours=2))},000 [ERROR] fresh failure: boom"
+    monkeypatch.setattr(sm, "PENDING_SAVES", tmp_path / "no-saves.jsonl")
+    score, issues = sm.check_errors(log, now=now)
+    assert score < 100
+    assert any("fresh failure" in i for i in issues)
+
+
+def test_check_errors_critical_always_surfaced(tmp_path, monkeypatch) -> None:
+    """A single, old [CRITICAL] is surfaced regardless of staleness heuristics."""
+    import selfreg_monitor as sm
+
+    now = datetime(2026, 6, 10, 12, 0, 0)
+    log = f"{_ts(now - timedelta(days=4))},000 [CRITICAL] disk full: boom"
+    monkeypatch.setattr(sm, "PENDING_SAVES", tmp_path / "no-saves.jsonl")
+    score, issues = sm.check_errors(log, now=now)
+    assert score < 100
+    assert any("disk full" in i for i in issues)
+
+
 # ----------------------------------------------------------------- check_runs
 # check_runs uses datetime.now() internally, so log lines are built relative
 # to the real clock.
@@ -259,3 +311,68 @@ def test_check_runs_weekly_only_stale() -> None:
     assert any("weekly" in i for i in issues)
     assert not any("dreaming" in i for i in issues)
     assert score == 75
+
+
+# --- check_hook_runtime: consumes hook-telemetry.jsonl aggregates ------------
+# (the ledger was write-only before this consumer existed)
+
+def test_hook_runtime_healthy_summary() -> None:
+    import selfreg_monitor as sm
+
+    summary = {"recall_engagement": {"count": 313, "error_rate": 0.0,
+                                     "p50_ms": 200.0, "p95_ms": 800.0}}
+    score, issues = sm.check_hook_runtime(summary)
+    assert score == 100
+    assert issues == []
+
+
+def test_hook_runtime_failing_hook_flagged() -> None:
+    import selfreg_monitor as sm
+
+    summary = {"auto_pinecone_save": {"count": 50, "error_rate": 0.4, "p95_ms": 500.0}}
+    score, issues = sm.check_hook_runtime(summary)
+    assert score == 75
+    assert any("auto_pinecone_save" in i and "fail" in i for i in issues)
+
+
+def test_hook_runtime_slow_hook_flagged() -> None:
+    import selfreg_monitor as sm
+
+    summary = {"slow_hook": {"count": 20, "error_rate": 0.0, "p95_ms": 20000.0}}
+    score, issues = sm.check_hook_runtime(summary)
+    assert score == 90
+    assert any("slow" in i for i in issues)
+
+
+def test_hook_runtime_low_count_ignored() -> None:
+    """Hooks with <10 runs in the window are too noisy to judge."""
+    import selfreg_monitor as sm
+
+    summary = {"rare_hook": {"count": 3, "error_rate": 1.0, "p95_ms": 99999.0}}
+    score, issues = sm.check_hook_runtime(summary)
+    assert score == 100
+    assert issues == []
+
+
+def test_hook_runtime_score_floor_zero() -> None:
+    import selfreg_monitor as sm
+
+    summary = {f"h{i}": {"count": 30, "error_rate": 0.9, "p95_ms": 60000.0}
+               for i in range(6)}
+    score, issues = sm.check_hook_runtime(summary)
+    assert score == 0
+    assert len(issues) == 12
+
+
+def test_hook_runtime_fail_open_on_summarize_error(monkeypatch) -> None:
+    """Telemetry loss must never break the health monitor itself."""
+    import selfreg_monitor as sm
+    import hook_telemetry
+
+    def boom(**kwargs):
+        raise RuntimeError("telemetry loss")
+
+    monkeypatch.setattr(hook_telemetry, "summarize", boom)
+    score, issues = sm.check_hook_runtime()
+    assert score == 100
+    assert issues == []

@@ -177,10 +177,15 @@ def tier_reason(
 
 def record_application(
     entry: dict[str, Any],
-    ledger_path: Path = _DEFAULT_LEDGER,
+    ledger_path: Path | None = None,
     now: datetime | None = None,
 ) -> None:
     """Append *entry* to the applied-ledger.jsonl file.
+
+    ledger_path=None resolves the module default AT CALL TIME (not at def
+    time), so the suite-wide conftest guard can monkeypatch _DEFAULT_LEDGER —
+    the 2026-07-02 audit found 59/62 production ledger rows were pytest
+    fixtures appended through this default, skewing trust-tier precision.
 
     The entry must contain at minimum:
         - ``item_id``   : unique identifier of the applied item
@@ -196,6 +201,8 @@ def record_application(
         ledger_path: Path to the JSONL ledger file (created if absent).
         now: Timestamp override for tests; defaults to UTC now.
     """
+    if ledger_path is None:
+        ledger_path = _DEFAULT_LEDGER
     if now is None:
         now = datetime.now(timezone.utc)
     record = dict(entry)

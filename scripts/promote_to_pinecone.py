@@ -161,9 +161,15 @@ def main():
 
     cmd = [sys.executable, str(PINECONE_CLI), "save",
            safe_ns, entry_id, args.text, "--meta", meta]
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
     if result.returncode != 0:
-        sys.exit(f"Failed: {result.stderr or result.stdout}")
+        err = (result.stderr or result.stdout or "").strip()
+        if result.returncode == 4:
+            # pinecone.py exit 4 = secret/PII guard refused the text. Surface the
+            # guard verdict verbatim; "Promoted" must never print in this path.
+            sys.exit(f"REFUSED by ingest guard — NOT promoted:\n{err}")
+        sys.exit(f"Failed (exit {result.returncode}): {err}")
 
     if safe_ns != args.namespace:
         print(f"Promoted: {entry_id} (namespace='{safe_ns}' from '{args.namespace}', type=promoted, ttl=NEVER_EXPIRE)")

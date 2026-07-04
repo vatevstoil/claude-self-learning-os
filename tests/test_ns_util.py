@@ -85,7 +85,10 @@ def test_research_wiki_alias_convergence():
     from ns_util import sanitize_ns
     # Hook-side map values and natural transliteration must converge on the
     # SAME canonical ns, else save and recall fragment.
+    # 2026-07-03: Stoil aliases merged into canonical "{{PRIVATE_NS}}" (walled in
+    # visibility_guard alongside the legacy names).
     assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
     assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
     assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
+    assert sanitize_ns("Delo-Zoya") == "{{PRIVATE_NS}}"
     assert sanitize_ns("Petar-Danov") == "PetarDanov"

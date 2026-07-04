@@ -142,6 +142,69 @@ class TestProjectFromTargetFile:
 
 
 # ---------------------------------------------------------------------------
+# 2b. _project_from_entry — backfilled non-path target_file fallback
+# ---------------------------------------------------------------------------
+
+class TestProjectFromEntry:
+    def test_slug_in_item_id_wins_over_path(self):
+        """Real auto-applied rows carry BOTH a cwd slug in item_id and a real
+        path in target_file. The slug must win: the path yields a directory
+        basename ("facturka.bg") that never prefix-matches the slug-form
+        cluster keys, starving the scoped pass for 100% of real rows."""
+        from ab_eval import _project_from_entry
+        entry = {
+            "item_id": "auto-boris-j--Antigraviti-Facturka-bg",
+            "target_file": "{{CODE_PATH}}\\Facturka.bg\\CLAUDE.md",
+        }
+        assert _project_from_entry(entry) == "j--antigraviti-facturka-bg"
+
+    def test_real_path_used_when_item_id_has_no_slug(self):
+        """No cwd slug in item_id (e.g. real habit rows) -> parent-dir fallback."""
+        from ab_eval import _project_from_entry
+        entry = {
+            "item_id": "auto-habit-grep-read-edit",
+            "target_file": "J:/Projects/MyProject/CLAUDE.md",
+        }
+        assert _project_from_entry(entry) == "myproject"
+
+    def test_backfilled_target_file_falls_back_to_item_id(self):
+        """target_file is a non-path placeholder -> derive project from item_id.
+
+        Regression test for the bug: 3 real ledger rows have
+        target_file="(backfilled from review-verdicts 2026-06-11)" (no path
+        separator), which previously made the project empty and starved the
+        project-scoped cluster match.
+        """
+        from ab_eval import _project_from_entry
+        entry = {
+            "item_id": "boris-j--antigraviti-facturka-bg",
+            "target_file": "(backfilled from review-verdicts 2026-06-11)",
+        }
+        result = _project_from_entry(entry)
+        assert result != ""
+        assert result == "j--antigraviti-facturka-bg"
+
+    def test_habit_style_id_with_routine_suffix(self):
+        """habit- prefixed id keeps the routine suffix in the derived project."""
+        from ab_eval import _project_from_entry
+        entry = {
+            "item_id": "habit-j--antigraviti-higgsfield-ai-powershell-read",
+            "target_file": "(backfilled from review-verdicts 2026-06-11)",
+        }
+        result = _project_from_entry(entry)
+        assert result == "j--antigraviti-higgsfield-ai-powershell-read"
+
+    def test_no_dash_in_item_id_returns_empty(self):
+        from ab_eval import _project_from_entry
+        entry = {"item_id": "noprefix", "target_file": "not-a-path-either"}
+        assert _project_from_entry(entry) == ""
+
+    def test_empty_target_file_and_item_id(self):
+        from ab_eval import _project_from_entry
+        assert _project_from_entry({"item_id": "", "target_file": ""}) == ""
+
+
+# ---------------------------------------------------------------------------
 # 3. load_ledger_tolerant
 # ---------------------------------------------------------------------------
 
@@ -633,3 +696,57 @@ class TestFindMatchingCluster:
         result = find_matching_cluster("unknownproject", rule_tokens, [c])
         # Low threshold (0.15) should still match
         assert result is not None
+
+    def test_habit_routine_suffix_scoped_matches_own_project_not_higher_sim_other(self):
+        """habit-style item_id-derived project (with routine suffix) must
+        prefix-match its own project's cluster in the scoped pass, even when a
+        DIFFERENT project's cluster has higher raw text similarity.
+
+        Regression test for the bug: rule_project derived from item_id like
+        "j--antigraviti-higgsfield-ai-powershell-read" never equals the
+        cluster's plain project key "j--antigraviti-higgsfield-ai" under exact
+        matching, so the scoped pass used to fail and fall through to the
+        cross-project pass, letting a higher-similarity sibling project
+        (e.g. DCTL) win instead.
+        """
+        from ab_eval import find_matching_cluster, normalize
+        rule_project = "j--antigraviti-higgsfield-ai-powershell-read"
+        rule_tokens = normalize("use powershell read tool instead of cat")
+
+        own_cluster = {
+            "id": "own-cluster",
+            "project": "j--antigraviti-higgsfield-ai",
+            "representative": "read tool call failed on windows path",
+            "examples": [],
+        }
+        other_cluster_higher_sim = {
+            "id": "other-cluster",
+            "project": "j--antigraviti-davinci-plugin-dctl",
+            "representative": "use powershell read tool instead of cat command",
+            "examples": [],
+        }
+
+        result = find_matching_cluster(
+            rule_project, rule_tokens, [other_cluster_higher_sim, own_cluster]
+        )
+        assert result is not None
+        assert result["id"] == "own-cluster"
+
+    def test_scoped_prefix_match_requires_nonempty_cluster_project(self):
+        """An empty cluster project key must never satisfy the scoped pass,
+        even though "" is technically a prefix-match-adjacent case."""
+        from ab_eval import find_matching_cluster, normalize
+        rule_tokens = normalize("always confirm before deleting files")
+        c_no_project = {
+            "id": "cnone", "project": "",
+            "representative": "files deleted without confirm",
+            "examples": [],
+        }
+        c_real = {
+            "id": "creal", "project": "realproject",
+            "representative": "files deleted without confirm",
+            "examples": [],
+        }
+        result = find_matching_cluster("realproject", rule_tokens, [c_no_project, c_real])
+        assert result is not None
+        assert result["id"] == "creal"

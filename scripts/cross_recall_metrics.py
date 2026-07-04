@@ -88,6 +88,35 @@ def _parse_ts(s: str) -> datetime | None:
         return None
 
 
+def project_threshold_bump(
+    metrics: dict, project: str, min_surfaced: int = 20, bump: float = 0.08
+) -> float:
+    """Per-project suppression decay — NOT a kill switch.
+
+    Returns `bump` when `project` has been surfaced >= min_surfaced times with
+    ZERO engagement in `metrics["per_project"]` (a chronic-noise project like
+    higgsfield.ai: 90 surfaced / 0 engaged). Returns 0.0 otherwise, including
+    when the project or its keys are missing (tolerant — never raises).
+
+    The caller adds this to the cross-project similarity threshold
+    (_XTHRESH), so a 0-engagement project needs a higher-signal match to
+    surface at all next time. Because every surfacing event keeps getting
+    logged regardless, the very next `cross_recall_metrics.py` run can see a
+    fresh engagement and the bump naturally drops back to 0 — self-correcting
+    decay, not a permanent ban.
+    """
+    try:
+        pp = (metrics or {}).get("per_project", {}) or {}
+        stats = pp.get(project) or {}
+        surfaced = int(stats.get("surfaced", 0))
+        engaged = int(stats.get("engaged", 0))
+    except Exception:
+        return 0.0
+    if surfaced >= min_surfaced and engaged == 0:
+        return bump
+    return 0.0
+
+
 def mark_used(vec_id: str) -> None:
     """Append an explicit 'this surfaced lesson was used' record."""
     USED.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +159,23 @@ def compute(days: int, now: datetime | None = None) -> dict:
             events.append(e)
 
     tracker = _load_json(TRACKER)
-    used_ids = {r.get("id") for r in _read_jsonl(USED) if r.get("id")}
+    # Used records keyed by id with their timestamps: a use only counts as
+    # engagement for surfacings that HAPPENED BEFORE it (mirrors is_rr's hc0
+    # ordering). Without this, one legacy/false used record marks the vid
+    # "engaged" for every future surfacing in every project — silently
+    # disabling project_threshold_bump. Records without a parseable ts are
+    # legacy-tolerated (count for any surfacing, the old behavior).
+    used_ts: dict[str, list[float]] = {}
+    legacy_used: set[str] = set()
+    for r in _read_jsonl(USED):
+        rid = r.get("id")
+        if not rid:
+            continue
+        uts = _parse_ts(r.get("ts", ""))
+        if uts is None:
+            legacy_used.add(rid)
+        else:
+            used_ts.setdefault(rid, []).append(uts.timestamp())
 
     n_events = len(events)
     n_silent = sum(1 for e in events if not e.get("surfaced"))
@@ -152,11 +197,15 @@ def compute(days: int, now: datetime | None = None) -> dict:
     # projects counts once per project), matching the per_project semantics.
 
     # map surfaced item -> its project (events carry project)
+    # Engaged ids per PROJECT (not per event) — the same vid surfaced in N
+    # sessions of one project must count as 1 engaged lesson, not N.
+    proj_engaged: dict[str, set[str]] = {}
     for e in events:
         proj = _enc_guard(e.get("project") or "?")
         pp = per_project.setdefault(proj, {"surfaced": 0, "engaged": 0})
-        # Track which ids have been engaged in THIS project already
-        proj_engaged_ids: set[str] = set()
+        proj_engaged_ids = proj_engaged.setdefault(proj, set())
+        ev_ts = _parse_ts(e.get("ts", ""))
+        ev_epoch = ev_ts.timestamp() if ev_ts else cutoff
         for s in (e.get("surfaced") or []):
             vid = s.get("id") or ""
             sc = float(s.get("score", 0.0))
@@ -164,7 +213,8 @@ def compute(days: int, now: datetime | None = None) -> dict:
             snippet_lens.append(len(s.get("t", "") or ""))
             hc_now = int(tracker.get(vid, {}).get("hit_count", 0))
             is_rr = hc_now > int(s.get("hc0", 0))
-            is_ex = vid in used_ids
+            is_ex = vid in legacy_used or any(
+                u >= ev_epoch for u in used_ts.get(vid, ()))
             if is_rr:
                 unique_rr_ids.add(vid)
             if is_ex:

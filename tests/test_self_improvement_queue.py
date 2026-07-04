@@ -181,6 +181,151 @@ def test_queue_excludes_suppressed(tmp_path, monkeypatch):
     )
 
 
+# ── discipline_gap source (measured gap → human-gated queue item) ───────────
+
+def _stats_file(tmp_path, name, model, target_metrics, baseline_metrics):
+    p = tmp_path / name
+    p.write_text(json.dumps({
+        "target": {"model": model, "sessions": 100, **target_metrics},
+        "baseline": {"model": "claude-fable-5", "sessions": 132, **baseline_metrics},
+    }), encoding="utf-8")
+    return p
+
+
+def _history_file(tmp_path, rows):
+    p = tmp_path / "discipline_history.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    return p
+
+
+def _hist_row(model, t, b, date="2026-06-21"):
+    return {"date": date, "target": model, "baseline": "claude-fable-5",
+            "t": t, "b": b}
+
+
+def test_discipline_gap_persistent_surfaces(tmp_path):
+    from self_improvement_queue import _load_discipline_gaps
+
+    t = {"abs_path_hygiene_pct": 24.8}
+    b = {"abs_path_hygiene_pct": 71.7}
+    stats = _stats_file(tmp_path, "s.json", "claude-opus-4-8", t, b)
+    hist = _history_file(tmp_path, [_hist_row("claude-opus-4-8", t, b, "2026-06-21"),
+                                    _hist_row("claude-opus-4-8", t, b, "2026-06-28")])
+    items = _load_discipline_gaps([stats], history_path=hist)
+    assert len(items) == 1
+    it = items[0]
+    assert it.id == "discipline-opus-4-8-abs_path_hygiene_pct"
+    assert it.type == "discipline_gap"
+    assert it.status == "queued"          # never auto_apply, by design
+    assert "abs_path_hygiene_pct" in it.description
+    assert "24.8" in it.description and "71.7" in it.description
+    assert "абсолютни пътища" in it.description   # suggested rule text
+    assert it.score <= 0.72 + 1e-9        # can never cross the 0.85 auto bar
+
+
+def test_discipline_gap_below_threshold_skipped(tmp_path):
+    from self_improvement_queue import _load_discipline_gaps
+
+    t = {"read_before_edit_pct": 87.8}
+    b = {"read_before_edit_pct": 86.4}    # target BEATS baseline
+    stats = _stats_file(tmp_path, "s.json", "claude-sonnet-4-6", t, b)
+    hist = _history_file(tmp_path, [_hist_row("claude-sonnet-4-6", t, b, "2026-06-21"),
+                                    _hist_row("claude-sonnet-4-6", t, b, "2026-06-28")])
+    assert _load_discipline_gaps([stats], history_path=hist) == []
+
+
+def test_discipline_gap_needs_two_history_rows(tmp_path):
+    """One-off blip (single weekly measurement) must NOT surface."""
+    from self_improvement_queue import _load_discipline_gaps
+
+    t = {"abs_path_hygiene_pct": 24.8}
+    b = {"abs_path_hygiene_pct": 71.7}
+    stats = _stats_file(tmp_path, "s.json", "claude-opus-4-8", t, b)
+    hist = _history_file(tmp_path, [_hist_row("claude-opus-4-8", t, b)])
+    assert _load_discipline_gaps([stats], history_path=hist) == []
+    # missing history file entirely → also nothing
+    assert _load_discipline_gaps([stats], history_path=tmp_path / "no.jsonl") == []
+    # duplicate rows for the SAME date (manual re-runs append) ≠ persistence:
+    # a single measurement run twice must not satisfy the 2-week gate
+    hist_dup = _history_file(tmp_path, [_hist_row("claude-opus-4-8", t, b, "2026-06-17")] * 5)
+    assert _load_discipline_gaps([stats], history_path=hist_dup) == []
+
+
+def test_discipline_gap_zero_sessions_skipped(tmp_path):
+    """Dead model pin → sessions=0, all pct=0.0 → would fabricate ~90pp gaps."""
+    import json as _json
+    from self_improvement_queue import _load_discipline_gaps
+
+    t = {"abs_path_hygiene_pct": 0.0}
+    b = {"abs_path_hygiene_pct": 71.7}
+    p = tmp_path / "s.json"
+    p.write_text(_json.dumps({
+        "target": {"model": "claude-sonnet-6", "sessions": 0, **t},
+        "baseline": {"model": "claude-fable-5", "sessions": 132, **b},
+    }), encoding="utf-8")
+    hist = _history_file(tmp_path, [_hist_row("claude-sonnet-6", t, b, "2026-06-21"),
+                                    _hist_row("claude-sonnet-6", t, b, "2026-06-28")])
+    assert _load_discipline_gaps([p], history_path=hist) == []
+
+
+def test_discipline_gap_capped_at_three_largest_first(tmp_path):
+    from self_improvement_queue import _load_discipline_gaps
+
+    t = {"reasoning_pct": 50.0, "reason_before_action_pct": 60.0,
+         "reeval_after_result_pct": 70.0, "abs_path_hygiene_pct": 20.0}
+    b = {"reasoning_pct": 90.0, "reason_before_action_pct": 90.0,
+         "reeval_after_result_pct": 90.0, "abs_path_hygiene_pct": 70.0}
+    stats = _stats_file(tmp_path, "s.json", "claude-opus-4-8", t, b)
+    hist = _history_file(tmp_path, [_hist_row("claude-opus-4-8", t, b, "2026-06-21"),
+                                    _hist_row("claude-opus-4-8", t, b, "2026-06-28")])
+    items = _load_discipline_gaps([stats], history_path=hist)
+    assert len(items) == 3
+    # largest gap (abs_path 50pp) ranks first; smallest (reeval 20pp) is cut
+    assert items[0].id.endswith("abs_path_hygiene_pct")
+    assert not any(i.id.endswith("reeval_after_result_pct") for i in items)
+
+
+def test_discipline_gap_dismissal_suppresses(tmp_path, monkeypatch):
+    """Stable id + suggestion-feedback filter = the whole dedup story."""
+    import suggestion_feedback as sf
+    import self_improvement_queue as q
+    from self_improvement_queue import build_queue
+
+    t = {"abs_path_hygiene_pct": 24.8}
+    b = {"abs_path_hygiene_pct": 71.7}
+    stats = _stats_file(tmp_path, "s.json", "claude-opus-4-8", t, b)
+    hist = _history_file(tmp_path, [_hist_row("claude-opus-4-8", t, b, "2026-06-21"),
+                                    _hist_row("claude-opus-4-8", t, b, "2026-06-28")])
+    kw = dict(boris_path=tmp_path / "b.json", promotions_path=tmp_path / "p.md",
+              habits_path=tmp_path / "h.json", graphify_path=tmp_path / "g.json",
+              ledger_path=tmp_path / "l.json",
+              discipline_stats_paths=[stats], discipline_history_path=hist)
+
+    fb = tmp_path / "fb.json"
+    monkeypatch.setattr(sf, "DEFAULT", fb, raising=False)
+    monkeypatch.setattr(q, "_FEEDBACK_PATH", fb, raising=False)
+
+    items = build_queue(**kw)
+    assert any(i.type == "discipline_gap" for i in items)
+    target = next(i.id for i in items if i.type == "discipline_gap")
+
+    sf.dismiss(target, path=fb)
+    ids_after = [i.id for i in build_queue(**kw)]
+    assert target not in ids_after
+
+
+def test_build_queue_discipline_source_is_opt_in(tmp_path):
+    """No discipline paths passed → source disabled (test isolation contract)."""
+    from self_improvement_queue import build_queue
+
+    items = build_queue(boris_path=tmp_path / "b.json",
+                        promotions_path=tmp_path / "p.md",
+                        habits_path=tmp_path / "h.json",
+                        graphify_path=tmp_path / "g.json",
+                        ledger_path=tmp_path / "l.json")
+    assert not any(i.id.startswith("discipline-") for i in items)
+
+
 def test_queue_includes_after_suppression_expires(tmp_path, monkeypatch):
     """After the cooldown expires the item must re-appear in the queue."""
     from datetime import datetime, timezone, timedelta

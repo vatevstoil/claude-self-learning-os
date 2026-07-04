@@ -15,7 +15,8 @@ Files consumed (read-only):
     ~/.claude/logs/improvement-queue.json   — current queue snapshot
     ~/.claude/logs/habit-ledger.json        — for habit resolution status
     ~/.claude/logs/skill-drafts/            — dirs = codified skills
-    ~/.claude/logs/boris-drafts/            — files = acted-on boris rules
+    ~/.claude/logs/boris-drafts/            — files (top level + archived/) = acted-on
+                                               boris rules; quarantine/ is excluded
     ~/.claude/logs/review-verdicts.json     — human accept/reject verdicts (exact match)
 
 Files maintained (written):
@@ -184,10 +185,13 @@ def is_resolved(
          Also resolved if the ledger entry for the item has
          ``status == "skill_exists"``.
 
-       * ``boris_rule``: Resolved if ANY file in ``boris_drafts_dir`` has a stem
-         (filename without extension) that appears as a substring within the
-         item's ``project`` or ``id``.  A boris-draft file being created is the
-         proxy for "acted on".
+       * ``boris_rule``: Resolved if ANY file in ``boris_drafts_dir`` — including
+         its ``archived/`` subdir (human-reviewed: applied or deliberately
+         skipped) — has a stem (filename without extension) that appears as a
+         substring within the item's ``project`` or ``id``.  A boris-draft file
+         being present is the proxy for "acted on". Files under a ``quarantine/``
+         subdir (invalid/corrupted attribution) are never matched — they must
+         not count as resolved.
 
     * ``graphify``: Always ``False`` — cannot be reliably detected.
 
@@ -257,8 +261,17 @@ def is_resolved(
         return False
 
     if item_type == "boris_rule":
-        if boris_drafts_dir.exists():
-            for entry in boris_drafts_dir.iterdir():
+        # Reviewed drafts live at top level (pending, legacy) or under
+        # archived/ (human-reviewed: applied or deliberately skipped) — both
+        # count as "acted on". quarantine/ holds invalid/corrupted-attribution
+        # drafts and is deliberately excluded so it can never fabricate a
+        # resolution. Explicit subpaths (not a blanket rglob) so an unrelated
+        # future subdir under boris-drafts/ does not silently change meaning.
+        scan_dirs = [boris_drafts_dir, boris_drafts_dir / "archived"]
+        for scan_dir in scan_dirs:
+            if not scan_dir.exists():
+                continue
+            for entry in scan_dir.iterdir():
                 if entry.is_file():
                     stem_lower = entry.stem.lower()
                     if stem_lower in item_project or stem_lower in item_id:

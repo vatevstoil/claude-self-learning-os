@@ -415,25 +415,33 @@ def main() -> None:
 
     reports = scan_projects(args.threshold)
 
-    # Always write compact stale-projects.txt for Phase 0 fast reads
+    # Always write BOTH the compact stale-projects.txt AND the full freshness.json,
+    # so a bare run can't leave the two caches inconsistent. Prior behaviour wrote
+    # freshness.json only with --out, so a manual run left it stale (selfreg /
+    # pending-summary then read yesterday's numbers). Writing the JSON BEFORE the
+    # cp1251-fragile table print also means a console encode crash can no longer
+    # cause a partial write.
     logs_dir = Path.home() / ".claude" / "logs"
     try:
         write_stale_summary(reports, args.threshold, logs_dir)
     except Exception as exc:
         print(f"WARN: could not write stale-projects.txt: {exc}", file=sys.stderr)
 
-    if args.as_json or args.out:
-        out_text = json.dumps(
-            build_json_payload(reports, args.threshold),
-            indent=2,
-            ensure_ascii=False,
-        )
-        if args.out:
-            args.out.parent.mkdir(parents=True, exist_ok=True)
-            args.out.write_text(out_text, encoding="utf-8")
-        if args.as_json:
-            print(out_text)
-    else:
+    out_text = json.dumps(
+        build_json_payload(reports, args.threshold),
+        indent=2,
+        ensure_ascii=False,
+    )
+    freshness_out = args.out or (logs_dir / "freshness.json")
+    try:
+        freshness_out.parent.mkdir(parents=True, exist_ok=True)
+        freshness_out.write_text(out_text, encoding="utf-8")
+    except Exception as exc:
+        print(f"WARN: could not write freshness.json: {exc}", file=sys.stderr)
+
+    if args.as_json:
+        print(out_text)
+    elif not args.out:
         print_table(reports, args.threshold)
 
     any_stale = any(r.is_stale(args.threshold) for r in reports)

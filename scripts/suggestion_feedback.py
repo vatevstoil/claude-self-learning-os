@@ -120,6 +120,8 @@ def dismiss(
         last_at=now.isoformat(),
         suppress_until=suppress_until.isoformat(),
         dismiss_count=dismiss_count,
+        implicit=False,  # explicit human "no" overrides a prior auto-dismiss —
+        # without this, audits/clamps misread human decisions as machine noise
     )
     data[item_id] = entry
     save_feedback(data, path)
@@ -221,8 +223,9 @@ def record_surfaced(
 
     Called by session_start_brief each time an item is shown to the user.
     After *threshold* surfaces without explicit accept/dismiss, the item is
-    auto-dismissed with the same exponential back-off as a manual dismissal
-    (marked ``implicit=True`` so it can be distinguished in audits).
+    auto-dismissed with a 1-week exponential back-off — deliberately shorter
+    than a manual dismissal's 4-week base (marked ``implicit=True`` so it can
+    be distinguished in audits).
 
     Already-dismissed or accepted items are not affected.
 
@@ -251,9 +254,14 @@ def record_surfaced(
     entry["last_surfaced"] = now.isoformat()
 
     if surfaced_count >= threshold:
-        # Auto-suppress using same exponential window as manual dismiss
+        # Auto-suppress with a SHORTER base than a manual dismiss: implicit
+        # means "not acted on in N surfaces", NOT "human said no". The 4-week
+        # base was locking fresh real signal out of the improvement queue for
+        # a month (2026-07-02 audit: live count=4 boris candidate suppressed
+        # to 07-30). 1 week still stops surfacing-flap; repeated ignores
+        # still back off exponentially (1 -> 2 -> 4 weeks).
         dismiss_count = entry.get("dismiss_count", 0) + 1
-        effective_weeks = 4 * (2 ** (dismiss_count - 1))
+        effective_weeks = 1 * (2 ** (dismiss_count - 1))
         suppress_until = now + timedelta(weeks=effective_weeks)
         entry.update(
             status="dismissed",

@@ -1,6 +1,6 @@
 ---
 name: dev-wiki
-description: "LLM-maintained development wiki for software projects. Two modes: CONCEIVE (develop software concept from idea to architecture) and TRACK (manage ongoing development with sprints, decisions, deployments, learnings). Creates and maintains an Obsidian-compatible wiki that accumulates project knowledge across sessions. Triggers on: 'dev wiki', 'wiki', 'init wiki', 'start project', 'new project', 'project wiki', 'knowledge base', 'track development', 'development plan', 'sprint planning', or when starting a new software project."
+description: "LLM-maintained development wiki for software projects. Two modes: CONCEIVE (develop software concept from idea to architecture) and TRACK (manage ongoing development with sprints, decisions, deployments, learnings). Creates and maintains an Obsidian-compatible wiki that accumulates project knowledge across sessions. Triggers on: 'dev wiki', 'wiki', 'init wiki', 'start project', 'new project', 'project wiki', 'knowledge base', 'track development', 'development plan', 'sprint planning', or when starting a new software project. ⛔ NOT: за sync на СЪЩЕСТВУВАЩ codebase wiki от source (ползвай wiki-sync)."
 ---
 
 # Dev Wiki

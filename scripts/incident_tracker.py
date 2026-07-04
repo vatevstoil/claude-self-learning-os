@@ -124,8 +124,14 @@ def _is_delegation_noise(text: str) -> bool:
 _FINANCIAL_NOISE_RE = re.compile(
     r"реални пари|истински пари|прехвърл\w*\s+\w*\s*пари|"
     r"\brevolut\b|банков\w*\s+сметк|\bIBAN\b|"
+    # Brokerage positions: a stock ticker within ~30 chars of a percentage OR an
+    # explicit finance noun (акции/брокер/портфейл/дивидент). A bare ticker next
+    # to everyday words (продава/позиция) is deliberately NOT matched — that
+    # would silently drop legitimate complaints about AMD/META/etc. products.
     r"\b(IONQ|NVDA|NVIDIA|INTC|AAPL|TSLA|AMD|MSFT|GOOGL|META|AMZN)\b"
-    r".{0,40}?(\d+\s*%|прода|купув|позици)",
+    r".{0,30}?(\d+\s*%|\bакци|\bброкер|\bпортфейл|\bдивидент)|"
+    r"(\d+\s*%|\bакци|\bброкер|\bпортфейл|\bдивидент).{0,30}?"
+    r"\b(IONQ|NVDA|NVIDIA|INTC|AAPL|TSLA|AMD|MSFT|GOOGL|META|AMZN)\b",
     re.IGNORECASE,
 )
 

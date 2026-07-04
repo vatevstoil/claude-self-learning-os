@@ -57,6 +57,10 @@ _INCIDENTS_PATH = _LOGS_DIR / "incidents.json"
 _FIX_PROPOSALS_PATH = _LOGS_DIR / "fix-proposals.json"
 _QUEUE_PATH = _LOGS_DIR / "improvement-queue.json"
 _REPORT_PATH = _LOGS_DIR / "integrity-report.json"
+_DISCIPLINE_STATS_PATH = _LOGS_DIR / "discipline_stats.json"
+_DISCIPLINE_HISTORY_PATH = _LOGS_DIR / "discipline_history.jsonl"
+_DISCIPLINE_STALE_DAYS = 10
+_DISCIPLINE_REGRESSION_PTS = 15.0
 
 # ---------------------------------------------------------------------------
 # Mojibake detection helpers
@@ -633,6 +637,81 @@ def check_queue_noise_ratio(
     return []
 
 
+def check_discipline_gated(
+    *,
+    stats_path: Path = _DISCIPLINE_STATS_PATH,
+    history_path: Path = _DISCIPLINE_HISTORY_PATH,
+    now: datetime | None = None,
+) -> list[Violation]:
+    """Flag a broken or regressing discipline-measurement loop.
+
+    The weekly dispatcher task refreshes discipline_stats.json (Sonnet vs Fable).
+    If that file is absent or stale, the self-measurement loop is not running —
+    exactly the gap (documented-but-unwired) this guard closes. Regression is
+    judged ONLY on the logging-INDEPENDENT sequence signals (read>edit, test>edit)
+    between the last two history rows; the thinking-dependent rates are confounded
+    by whether a session logged thinking, so they are never used here.
+    """
+    if not stats_path.exists():
+        return [{
+            "check": "discipline_gated",
+            "severity": "medium",
+            "detail": f"{stats_path.name} absent — the weekly discipline task is not "
+                      "producing stats (loop unwired or failing).",
+        }]
+    out: list[Violation] = []
+    ref = (now or now_utc()).timestamp()
+    try:
+        age_days = (ref - stats_path.stat().st_mtime) / 86400.0
+    except OSError:
+        age_days = 0.0
+    if age_days > _DISCIPLINE_STALE_DAYS:
+        out.append({
+            "check": "discipline_gated",
+            "severity": "low",
+            "detail": f"{stats_path.name} stale ({age_days:.0f}d > {_DISCIPLINE_STALE_DAYS}d) "
+                      "— weekly discipline task may have stopped refreshing it.",
+        })
+    rows: list[dict] = []
+    if history_path.exists():
+        for line in history_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    # The weekly task appends one row PER model run (Sonnet then Opus), so the
+    # history interleaves targets. Track the PRIMARY model — the one whose stats
+    # are the canonical discipline_stats.json (Sonnet, the default driver) — and
+    # compare only ITS rows. Otherwise a Sonnet-vs-Opus diff masquerades as a
+    # regression, and the secondary (Opus, always appended last) shadows the primary.
+    stats = load_json_tolerant(stats_path, {})
+    primary = (stats.get("target") or {}).get("model") if isinstance(stats, dict) else None
+    if rows:
+        target = primary or rows[-1].get("target")
+        same = [r for r in rows if r.get("target") == target]
+    else:
+        same = []
+    if len(same) >= 2:
+        prev, last = same[-2], same[-1]
+        for key, label in (("read_before_edit_pct", "read>edit"),
+                           ("real_test_after_edit_pct", "test>edit")):
+            pv = (prev.get("t") or {}).get(key)
+            lv = (last.get("t") or {}).get(key)
+            if (isinstance(pv, (int, float)) and isinstance(lv, (int, float))
+                    and pv - lv >= _DISCIPLINE_REGRESSION_PTS):
+                out.append({
+                    "check": "discipline_gated",
+                    "severity": "medium",
+                    "detail": f"discipline regression: {label} {pv:.0f}%→{lv:.0f}% "
+                              f"(-{pv - lv:.0f} pts) for {last.get('target', '?')} "
+                              f"between {prev.get('date', '?')} and {last.get('date', '?')}.",
+                })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
@@ -650,6 +729,8 @@ def run_all(
     incidents_path: Path = _INCIDENTS_PATH,
     fix_proposals_path: Path = _FIX_PROPOSALS_PATH,
     queue_path: Path = _QUEUE_PATH,
+    discipline_stats_path: Path = _DISCIPLINE_STATS_PATH,
+    discipline_history_path: Path = _DISCIPLINE_HISTORY_PATH,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Run all integrity checks and return the report dict.
@@ -687,6 +768,13 @@ def run_all(
     )
     all_violations.extend(check_accepted_provenance_valid(fix_proposals_path=fix_proposals_path))
     all_violations.extend(check_queue_noise_ratio(queue_path=queue_path))
+    all_violations.extend(
+        check_discipline_gated(
+            stats_path=discipline_stats_path,
+            history_path=discipline_history_path,
+            now=now,
+        )
+    )
 
     counts: dict[str, int] = {sev: 0 for sev in _SEVERITIES}
     for v in all_violations:

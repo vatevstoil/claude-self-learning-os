@@ -41,7 +41,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Private / legal namespace markers — sealed personal knowledge that must NEVER
 # be ingested into the searchable store. Mirrors visibility_guard / the public
-# release denylist. Bare author identity (Stoil/Vatev/{{PRIVATE_NS}} alone) is NOT here —
+# release denylist. Bare author identity (Stoil/Vatev/Zoya alone) is NOT here —
 # only the multi-word / namespace forms are the actual leak vector.
 # ---------------------------------------------------------------------------
 _PRIVATE_MARKERS_FALLBACK = (
@@ -61,7 +61,7 @@ def _load_private_markers() -> tuple[str, ...]:
         _s.path.insert(0, _o.path.join(_o.path.expanduser("~"), ".claude", "scripts"))
         from visibility_guard import SAFETY_DEFAULT
         for n in SAFETY_DEFAULT:
-            if n not in {"Stoil", "{{PRIVATE_NS}}", "{{PRIVATE_NS}}"}:  # bare words → too broad
+            if n not in {"Stoil", "Zoya", "Lichno"}:  # bare words → too broad
                 markers.add(n)
     except Exception:
         pass

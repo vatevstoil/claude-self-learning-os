@@ -185,6 +185,11 @@ def check_errors(
     """
     _now = now or datetime.now()
     cutoff = _now - timedelta(days=window_days)
+    # A one-off [ERROR] that neither recurs nor is recent (within this horizon)
+    # is treated as stale/resolved: a single historical error must not pin the
+    # health grade down for the full 7-day window. [CRITICAL], recurring, or
+    # recent errors are always surfaced (see per-script evaluation below).
+    stale_error_after = timedelta(hours=48)
 
     lines = text.splitlines()
 
@@ -228,12 +233,22 @@ def check_errors(
             continue
 
         # [ERROR] / [CRITICAL] lines (not associated with a specific script —
-        # keep as free-form issue; cleared only if no subsequent occurrences)
+        # free-form issues). Track occurrence count, most-recent timestamp, and
+        # whether any occurrence was CRITICAL, so a single stale [ERROR] can be
+        # distinguished from a recurring or recent one in the evaluation pass.
         if "[ERROR]" in ln or "[CRITICAL]" in ln:
             msg = ln.split("]", 1)[-1].strip()[:80]
             key = f"__log_{msg[:40]}"
-            state = script_state.setdefault(key, {"rc": None, "timeout": False, "error": None})
+            state = script_state.setdefault(
+                key,
+                {"rc": None, "timeout": False, "error": None,
+                 "count": 0, "last_ts": None, "critical": False},
+            )
             state["error"] = msg
+            state["count"] = state.get("count", 0) + 1
+            state["last_ts"] = ts
+            if "[CRITICAL]" in ln:
+                state["critical"] = True
 
     # Evaluate last-state per script
     issues: list[str] = []
@@ -242,7 +257,13 @@ def check_errors(
             if state["timeout"]:
                 issues.append(script.replace("__timeout_", "TIMEOUT: ")[:80])
         elif script.startswith("__log_"):
-            if state["error"]:
+            if not state.get("error"):
+                continue
+            # Surface only if CRITICAL, recurring (seen >1x), or recent — a
+            # single, non-recurring, non-recent [ERROR] is treated as stale.
+            last_ts = state.get("last_ts")
+            recent = last_ts is not None and (_now - last_ts) <= stale_error_after
+            if state.get("critical") or state.get("count", 0) >= 2 or recent:
                 issues.append(state["error"])
         else:
             rc = state["rc"]
@@ -368,6 +389,41 @@ def check_hooks() -> tuple[int, list[str]]:
     return score, issues
 
 
+def check_hook_runtime(summary: dict | None = None) -> tuple[int, list[str]]:
+    """Score hook RUNTIME health from hook-telemetry.jsonl (7-day window).
+
+    check_hooks() verifies registration only; this consumes the telemetry
+    ledger that was previously write-only. Fail-open: telemetry loss must
+    never break the health monitor itself.
+    """
+    issues: list[str] = []
+    if summary is None:
+        try:
+            from hook_telemetry import summarize
+            summary = summarize(window_days=7)
+        except Exception:
+            return 100, []
+    score = 100
+    fails: list[str] = []
+    slows: list[str] = []
+    for name, agg in sorted((summary or {}).items()):
+        count = agg.get("count", 0) or 0
+        if count < 10:
+            continue  # too few runs to judge fairly
+        rate = agg.get("error_rate", 0.0) or 0.0
+        p95 = agg.get("p95_ms", 0.0) or 0.0
+        if rate > 0.20:
+            fails.append(f"hook {name}: {round(rate * 100)}% fail (n={count})")
+            score -= 25
+        if p95 > 15000:
+            slows.append(f"hook {name}: p95 {round(p95 / 1000)}s (slow)")
+            score -= 10
+    # Fail-first ordering: issues[0] feeds the single always-surfaced 🚨 slot
+    # in run() — a cosmetic slow hook must never mask a hard-failing one.
+    issues = fails + slows
+    return max(0, score), issues
+
+
 # --------------------------------------------------------------------------- main
 def grade(score: int) -> str:
     return ("A" if score >= 90 else "B" if score >= 80 else "C" if score >= 70
@@ -384,6 +440,11 @@ def run(do_print: bool) -> dict:
     hyg_s, hyg_i = check_hygiene()
     disp_s, disp_i = check_dispatcher()
     hooks_s, hooks_i = check_hooks()
+    # Runtime health folds into the SAME hooks component — the weighted formula
+    # below sums to 1.00 and must not gain a ninth weight.
+    hook_rt_s, hook_rt_i = check_hook_runtime()
+    hooks_s = min(hooks_s, hook_rt_s)
+    hooks_i = hooks_i + hook_rt_i
 
     # Weighted overall (sums to 1.00): errors + cron + hooks + hygiene are most
     # critical — hooks are the live nervous system, weighted so an empty-hooks
@@ -434,8 +495,11 @@ def run(do_print: bool) -> dict:
     # of overall grade (an empty-hooks outage only drops grade to ~B, which the
     # startup digest would otherwise not show). Prepend to regressions, which the
     # SessionStart brief always surfaces.
-    if hooks_i:
-        regressions.insert(0, f"🚨 {hooks_i[0]}")
+    # Only HARD hook issues (missing registration / failing) earn the critical
+    # banner — a merely slow hook as a permanent 🚨 desensitizes real alerts.
+    hard_hooks = [i for i in hooks_i if "(slow)" not in i]
+    if hard_hooks:
+        regressions.insert(0, f"🚨 {hard_hooks[0]}")
     # Failed self-healing needs a human NOW — always surface at SessionStart.
     esc = _json(LOGS / "escalation.json")
     if esc.get("needs_human"):

@@ -79,11 +79,11 @@ def test_valid_accepted_provenance_preserved():
 def test_accept_sets_tracked_provenance():
     from incident_fix_proposer import accept
     doc = {"proposals": [{"id": "x1", "project": "Facturka", "status": "proposed"}]}
-    assert accept(doc, "x1", actor="stoil", now=NOW) is True
+    assert accept(doc, "x1", actor="{{PRIVATE_NS}}", now=NOW) is True
     p = doc["proposals"][0]
     assert p["status"] == "accepted"
     assert p["accepted_by_user"] == NOW.date().isoformat()
-    assert p["accepted_actor"] == "stoil"
+    assert p["accepted_actor"] == "{{PRIVATE_NS}}"
     assert accept(doc, "missing", now=NOW) is False
 
 

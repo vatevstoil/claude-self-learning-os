@@ -27,6 +27,9 @@ from urllib.error import HTTPError, URLError
 # UnicodeEncodeError → blind spot; CLI users see crashes mid-response.
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    # stderr too: guard SKIP/BLOCKED notes go to stderr and are captured by
+    # promote_to_pinecone (utf-8 pipe) — locale-encoded bytes would mojibake.
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 except Exception:
     pass
 
@@ -47,6 +50,16 @@ class QuotaExhaustedError(PineconeError):
     the save locally and replay it after the quota resets, instead of silently
     losing the learning. Stays a PineconeError so existing `except PineconeError`
     paths (query_and_track) still degrade gracefully (recall → []).
+    """
+
+
+class GuardBlockedError(Exception):
+    """Raised when the local store's secret/PII guard refuses the text.
+
+    Deliberately NOT a PineconeError: guard-refused content must never enter the
+    plaintext fallback queue (the queue would leak exactly what the guard blocks)
+    and must never be retried — it fails loudly instead (cmd_save → exit 4).
+    str(exc) is the guard name ('secret' / 'pii'), never the text itself.
     """
 
 
@@ -138,10 +151,20 @@ def _do_save(namespace, entry_id, text, meta: dict) -> None:
     """Embed `text` and upsert one vector. Raises QuotaExhaustedError on quota,
     PineconeError on other API failure. Shared by cmd_save and replay_queue."""
     if MEMORY_BACKEND == "local":
+        lr = _local()
         try:
-            _local().upsert(namespace, entry_id, text, meta)
+            stored = lr.upsert(namespace, entry_id, text, meta)
         except Exception as e:  # local store/embed failure → PineconeError so
             raise PineconeError(f"local save failed: {e}") from e  # callers degrade
+        if not stored:
+            # upsert() returned False = a guard refused the text. Silent exit 0
+            # here made promote_to_pinecone print a false "Promoted" while the
+            # row never reached local_rag.db.
+            try:
+                reason = lr.guard_reason(text) or "unknown"
+            except Exception:
+                reason = "unknown"
+            raise GuardBlockedError(reason)
         return
     vec = embed(text, is_query=False)
     _req(
@@ -192,6 +215,18 @@ def replay_queue() -> dict:
         if not proc.exists():
             return {"replayed": 0, "pending": 0}
     rows = [l for l in proc.read_text(encoding="utf-8").splitlines() if l.strip()]
+    # Warm bge-m3 before draining. Per-item saves embed with a hook-safe 6s timeout
+    # (local_rag.upsert), but a COLD model loads in ~11.5s → without a warm-up every
+    # item times out and re-queues forever. Replay is a background task (not a hook),
+    # so pre-load the model once with a generous timeout. Best-effort: on failure,
+    # drain anyway (items that still time out simply retry next run, as before).
+    if rows and MEMORY_BACKEND == "local":
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from embed_backend import local_embed as _warm_embed
+            _warm_embed("warmup", timeout=30)
+        except Exception:
+            pass
     replayed = 0
     remaining: list[str] = []
     stopped = False
@@ -206,6 +241,9 @@ def replay_queue() -> dict:
         try:
             _do_save(rec["namespace"], rec["id"], rec["text"], rec.get("meta") or {})
             replayed += 1
+        except GuardBlockedError:
+            continue  # guard-refused: drop — retrying can never succeed, and the
+            # line must not keep cycling through the plaintext queue file
         except QuotaExhaustedError:
             stopped = True
             remaining.append(line)
@@ -232,6 +270,16 @@ def cmd_save(args):
             meta[k.strip()] = v.strip()
     try:
         _do_save(args.namespace, args.id, args.text, meta)
+    except GuardBlockedError as e:
+        # Guard-refused content: fail LOUDLY (exit 4), name the guard, never
+        # queue it, never echo the text. Exit codes: 0=saved, 3=queued, 4=blocked.
+        label = {
+            "secret": "secret-guard (credential-like content)",
+            "pii": "pii-guard (EGN/card/IBAN/legal/private-marker)",
+        }.get(str(e), f"ingest guard ({e})")
+        print(f"BLOCKED by {label}: ns={args.namespace} id={args.id} — NOT saved",
+              file=sys.stderr)
+        sys.exit(4)
     except QuotaExhaustedError:
         # Quota exhausted — queue locally instead of losing the learning. Exit 3
         # signals callers (auto_pinecone_save) that it was QUEUED, not lost.

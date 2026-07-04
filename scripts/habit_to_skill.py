@@ -419,9 +419,25 @@ def process_accepted_habits(
             dest_file.write_text(content, encoding="utf-8")
             written.append(dest_file)
             print(f"[habit_to_skill] scaffolded '{item_id}' -> {dest_file}", file=sys.stderr)
-            # GC: accepted items are installed by the caller — remove the
-            # draft dir so it doesn't linger in skill-drafts/ forever.
-            shutil.rmtree(dest_dir, ignore_errors=True)
+            # Record in applied-ledger.jsonl so the apply-funnel KPI counts
+            # human-accepted habit scaffolds, not only auto-applied ones
+            # (the 2026-06 funnel bug — see process_accepted_boris).
+            try:
+                from trust_tiers import record_application
+                record_application({
+                    "item_id": item_id,
+                    "item_type": "habit",
+                    "tier": 1,
+                    "target_file": str(dest_file),
+                    "rollback_marker": item_id,
+                    "source": "human_accept",
+                })
+            except Exception as _lexc:  # ledger hiccup must never fail the scaffold
+                print(f"[habit_to_skill] ledger write skipped for {item_id}: {_lexc}", file=sys.stderr)
+            # NB: do NOT GC the draft here. auto_apply_habits() reads it from
+            # skill-drafts/ on the next pipeline step (--auto-apply) and removes
+            # it only AFTER a successful install. Deleting it now would orphan the
+            # scaffold and break that handoff (accepted habits never get applied).
         except Exception as exc:
             print(
                 f"[habit_to_skill] warning: could not write {dest_file}: {exc}",
@@ -522,13 +538,16 @@ def _install_skill(
 def auto_apply_habits(
     drafts_dir: Path = _DEFAULT_OUT_DIR,
     skills_dir: Path = _DEFAULT_SKILLS_DIR,
-    ledger_path: Path = _DEFAULT_LEDGER_AA,
+    ledger_path: Path | None = None,
     pending_review_path: Path = _DEFAULT_PENDING_REVIEW_AA,
     effectiveness_path: Path | None = None,
     overrides_path: Path | None = None,
     now: datetime | None = None,
 ) -> list[Path]:
     """Auto-install habit skills whose trust tier >= 1 AND judge says useful.
+
+    ledger_path=None resolves _DEFAULT_LEDGER_AA at CALL time so the
+    suite-wide conftest ledger guard can redirect it.
 
     Scans *drafts_dir* for skill draft subdirectories.  For each that:
       - has not already been applied (ledger dedup),
@@ -561,6 +580,8 @@ def auto_apply_habits(
         print("[habit_to_skill] trust_tiers not available — auto-apply skipped", file=sys.stderr)
         return []
 
+    if ledger_path is None:
+        ledger_path = _DEFAULT_LEDGER_AA
     if now is None:
         now = datetime.now(timezone.utc)
 

@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import sys
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -200,23 +200,26 @@ def synthesize_rule_with_llm(
 ) -> str:
     """Call LLM to synthesize a single imperative rule from correction examples.
 
-    Uses llm_judge.judge_text as the LLM transport.  If the LLM is unavailable
-    or returns a bad result, falls back to a safe "NEEDS HUMAN REWRITE: <hint>"
-    marker so that auto_apply_boris writes a human-readable placeholder instead
-    of verbatim junk.
+    Uses llm_judge.call_ollama_raw as the LLM transport (raw free-text, NOT
+    judge_text — the synthesis prompt asks for plain rule text, which
+    judge_text's {verdict:useful|junk} JSON parser would always reject).  If
+    the LLM is unavailable or returns a bad result, falls back to a safe
+    "NEEDS HUMAN REWRITE: <hint>" marker so that auto_apply_boris writes a
+    human-readable placeholder instead of verbatim junk.
 
     Args:
         examples: Filtered correction examples to synthesize from.
-        judge_text_fn: Injectable judge_text callable (for testing without
-            network). If None, imports from llm_judge at call time.
+        judge_text_fn: Injectable raw-LLM callable (for testing without
+            network), same signature as llm_judge.call_ollama_raw. If None,
+            imports call_ollama_raw from llm_judge at call time.
 
     Returns:
         Rule string (<=140 chars) or "NEEDS HUMAN REWRITE: <hint>" fallback.
     """
     if judge_text_fn is None:
         try:
-            from llm_judge import judge_text as _judge_text
-            judge_text_fn = _judge_text
+            from llm_judge import call_ollama_raw as _call_ollama_raw
+            judge_text_fn = _call_ollama_raw
         except ImportError:
             judge_text_fn = None
 
@@ -235,48 +238,49 @@ def synthesize_rule_with_llm(
     user_text = "Correction examples:\n" + "\n".join(f"- {ex}" for ex in examples[:5])
 
     try:
-        result = judge_text_fn(
+        raw_rule = judge_text_fn(
             system_prompt=_RULE_SYNTHESIS_SYSTEM_PROMPT,
             user_text=user_text,
         )
     except Exception:
         return fallback
 
-    if result is None:
-        # LLM unavailable
-        return fallback
-
-    # judge_text returns {"verdict", "score", "reason"} — for rule synthesis
-    # we abuse the "reason" field to carry the rule text, since the system
-    # prompt instructs the LLM to output only the rule.
-    # However, some LLMs may put the rule in "verdict" or return raw text in
-    # "reason". We handle both: if verdict is the raw rule (not "useful"/"junk"),
-    # use it; otherwise fall back to "reason".
-    verdict = result.get("verdict", "")
-    reason = result.get("reason", "")
-
-    # Pick whichever field looks like an actual rule (not a judge verdict label)
-    raw_rule = ""
-    if verdict not in ("useful", "junk", ""):
-        raw_rule = verdict
-    elif reason and len(reason) > 5:
-        raw_rule = reason
+    # Tolerant of an injected judge_text_fn double still shaped like the old
+    # {"verdict", "score", "reason"} dict (legacy judge_text contract) —
+    # extract the free-text field. Real production path (call_ollama_raw)
+    # always returns str | None.
+    if isinstance(raw_rule, dict):
+        verdict = raw_rule.get("verdict", "")
+        reason = raw_rule.get("reason", "")
+        raw_rule = verdict if verdict not in ("useful", "junk", "") else reason
 
     if not raw_rule:
+        # LLM unavailable or returned empty content
         return fallback
 
-    # Validate: must not be echo of examples verbatim, must be <=140 chars
     rule = raw_rule.strip()
-    if len(rule) > _RULE_MAX_CHARS:
-        rule = rule[:_RULE_MAX_CHARS].rsplit(" ", 1)[0]
 
     # Reject if it's just "NEEDS HUMAN REWRITE" from LLM (passthrough)
     if rule.upper().startswith("NEEDS HUMAN REWRITE"):
         return fallback
 
-    # Reject if rule is verbatim copy of one of the examples (LLM just echoed)
-    if any(rule.strip() == ex.strip() for ex in examples):
+    # Reject if rule is a verbatim copy of (or contains) one of the examples —
+    # checked BEFORE truncation so truncating can't dodge the echo check.
+    if any(rule.strip() == ex.strip() or ex.strip() in rule for ex in examples):
         return fallback
+
+    # Reject markdown-breaking / file-import-injection content: a fenced code
+    # block, a leading '@' file-import token, or a leading markdown heading —
+    # this rule text is spliced verbatim into CLAUDE.md's Learned Rules list.
+    if "```" in rule:
+        return fallback
+    first_token = rule.split(None, 1)[0] if rule.split() else ""
+    if first_token.startswith("@") or rule.lstrip().startswith("#"):
+        return fallback
+
+    # Truncate to max length AFTER the content-safety checks above.
+    if len(rule) > _RULE_MAX_CHARS:
+        rule = rule[:_RULE_MAX_CHARS].rsplit(" ", 1)[0]
 
     # Sanity: non-empty after trimming
     if not rule:
@@ -697,6 +701,19 @@ def process_accepted_boris(
                 log.warning("process_accepted_boris: could not extract rule from %s", draft_file)
                 continue
 
+            # Never write an un-synthesized placeholder into CLAUDE.md (mirrors
+            # the same guard in auto_apply_boris). A human "accepting" an item
+            # from the queue may not have opened the actual draft — the queue
+            # label ("useful", high score) is derived from correction count,
+            # not from whether LLM synthesis actually produced a real rule.
+            if rule_text.strip().upper().startswith("NEEDS HUMAN REWRITE"):
+                log.warning(
+                    "process_accepted_boris: skipping %s — rule is a "
+                    "NEEDS-HUMAN-REWRITE placeholder, not a synthesized rule",
+                    project_key,
+                )
+                continue
+
             # Resolve CLAUDE.md path via path hint — fuzzy match against real
             # directories to handle space/dot/dash ambiguity in the encoding.
             path_hint = _encode_to_path_hint(project_key)
@@ -715,13 +732,17 @@ def process_accepted_boris(
                 continue
             claude_md = real_dir / "CLAUDE.md"
 
-            today = date.today().isoformat()
+            # Wrap in the same <!-- auto-applied:... --> markers auto_apply_boris
+            # uses, so trust_tiers.rollback_last's marker-strip regex can find
+            # and undo this entry too (previously this path wrote a bare "- rule"
+            # line with no marker, making the recorded ledger rollback_marker a
+            # silent no-op for every human-accepted rule).
+            ts_str = datetime.now(timezone.utc).isoformat()
+            open_marker = f"<!-- auto-applied:{item_id} tier:1 {ts_str} -->"
+            close_marker = f"<!-- /auto-applied:{item_id} -->"
+            block = f"{open_marker}\n- {rule_text}\n{close_marker}\n"
 
             if claude_md.exists():
-                # Backup before modifying
-                backup_path = Path(str(claude_md) + f".boris-backup-{today}")
-                backup_path.write_bytes(claude_md.read_bytes())
-
                 content = claude_md.read_text(encoding="utf-8")
 
                 # Find ## Learned Rules section and append after its last line
@@ -733,25 +754,43 @@ def process_accepted_boris(
                 if section_match:
                     # Append the rule line at the end of the section block
                     insert_pos = section_match.end()
-                    rule_line = f"- {rule_text}\n"
-                    content = content[:insert_pos] + rule_line + content[insert_pos:]
+                    content = content[:insert_pos] + block + content[insert_pos:]
                 else:
                     # No ## Learned Rules section — append one at end of file
                     if not content.endswith("\n"):
                         content += "\n"
-                    content += f"\n## Learned Rules\n- {rule_text}\n"
+                    content += f"\n## Learned Rules\n{block}"
 
                 claude_md.write_text(content, encoding="utf-8")
             else:
                 # Create a minimal CLAUDE.md with the rule
                 claude_md.parent.mkdir(parents=True, exist_ok=True)
                 claude_md.write_text(
-                    f"# Project Rules\n\n## Learned Rules\n- {rule_text}\n",
+                    f"# Project Rules\n\n## Learned Rules\n{block}",
                     encoding="utf-8",
                 )
 
             applied.append(item_id)
             log.info("process_accepted_boris: applied '%s' -> %s", rule_text[:60], claude_md)
+
+            # Record in applied-ledger.jsonl so the apply-funnel KPI
+            # (outcome_kpi._compute_apply_funnel) sees human-accepted applies,
+            # not only auto-applied ones. Without this the ledger stays empty
+            # even after real applies → apply_funnel reports ledger_missing
+            # forever (the 2026-06 funnel bug: 3 rules accepted+applied on 06-11,
+            # yet applied-ledger.jsonl never existed).
+            try:
+                from trust_tiers import record_application
+                record_application({
+                    "item_id": item_id,
+                    "item_type": "boris_rule",
+                    "tier": 1,  # human review = trusted decision
+                    "target_file": str(claude_md),
+                    "rollback_marker": item_id,
+                    "source": "human_accept",
+                })
+            except Exception as ledger_exc:  # a ledger hiccup must never fail the apply
+                log.warning("process_accepted_boris: ledger write skipped for %s: %s", item_id, ledger_exc)
 
         except Exception as exc:
             log.error("process_accepted_boris: error processing %s: %s", item_id, exc)
@@ -781,13 +820,16 @@ _AUTO_APPLY_MAX_PER_RUN = 2
 
 def auto_apply_boris(
     drafts_dir: Path = _DEFAULT_OUT_DIR,
-    ledger_path: Path = _DEFAULT_LEDGER,
+    ledger_path: Path | None = None,
     pending_review_path: Path = _DEFAULT_PENDING_REVIEW,
     effectiveness_path: Path | None = None,
     overrides_path: Path | None = None,
     now: datetime | None = None,
 ) -> list[str]:
     """Auto-apply boris drafts whose trust tier is >= 1.
+
+    ledger_path=None resolves _DEFAULT_LEDGER at CALL time so the suite-wide
+    conftest ledger guard can redirect it (see trust_tiers.record_application).
 
     Scans *drafts_dir* for ``.md`` draft files.  For each draft that has not
     already been applied (deduplication via ledger) and whose tier >= 1, the
@@ -823,6 +865,8 @@ def auto_apply_boris(
         print("[boris_draft] trust_tiers not available — auto-apply skipped", file=_sys.stderr)
         return []
 
+    if ledger_path is None:
+        ledger_path = _DEFAULT_LEDGER
     if now is None:
         now = datetime.now(timezone.utc)
 
@@ -895,11 +939,12 @@ def auto_apply_boris(
         block = f"{open_marker}\n{rule_line}\n{close_marker}\n"
 
         try:
-            today = date.today().isoformat()
+            # No file-copy backup here: the write below is already wrapped in
+            # <!-- auto-applied:... --> markers and recorded in the ledger
+            # (record_application below), which is what trust_tiers.rollback_last
+            # actually reads to undo an entry. A raw .autoapply-backup-* copy
+            # would have zero consumer (grep confirms rollback never reads it).
             if claude_md.exists():
-                backup_path = Path(str(claude_md) + f".autoapply-backup-{today}")
-                backup_path.write_bytes(claude_md.read_bytes())
-
                 content = claude_md.read_text(encoding="utf-8")
                 section_match = re.search(
                     r"(^## Learned Rules\s*\n)(.*?)(?=\n## |\Z)",

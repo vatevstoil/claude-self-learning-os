@@ -246,3 +246,51 @@ def test_filter_meaningful_all_meaningful_types():
     ]
     result = filter_meaningful(hits)
     assert len(result) == len(MEANINGFUL_TYPES)
+
+
+# ---------------------------------------------------------------------------
+# NEW TESTS — project_threshold_bump (per-project suppression decay)
+# ---------------------------------------------------------------------------
+
+def test_project_threshold_bump_applies_when_chronic_zero_engagement():
+    """surfaced >= min_surfaced AND engaged == 0 -> bump returned."""
+    import cross_recall_metrics as crm
+    metrics = {"per_project": {"higgsfield.ai": {"surfaced": 90, "engaged": 0}}}
+    assert crm.project_threshold_bump(metrics, "higgsfield.ai") == 0.08
+
+
+def test_project_threshold_bump_zero_when_engaged():
+    """Any engagement (even 1) must suppress the bump entirely."""
+    import cross_recall_metrics as crm
+    metrics = {"per_project": {"Move": {"surfaced": 12, "engaged": 6}}}
+    assert crm.project_threshold_bump(metrics, "Move") == 0.0
+
+
+def test_project_threshold_bump_zero_below_min_surfaced():
+    """Below min_surfaced -> no bump, even with 0 engagement (too little data)."""
+    import cross_recall_metrics as crm
+    metrics = {"per_project": {"Autoagency": {"surfaced": 4, "engaged": 0}}}
+    assert crm.project_threshold_bump(metrics, "Autoagency") == 0.0
+
+
+def test_project_threshold_bump_zero_missing_project():
+    """Project absent from per_project -> 0.0, never raises."""
+    import cross_recall_metrics as crm
+    metrics = {"per_project": {"Facturka.bg": {"surfaced": 30, "engaged": 5}}}
+    assert crm.project_threshold_bump(metrics, "NeverSeenProject") == 0.0
+
+
+def test_project_threshold_bump_zero_missing_keys_tolerant():
+    """Missing 'per_project' key, empty metrics dict, or None must not raise."""
+    import cross_recall_metrics as crm
+    assert crm.project_threshold_bump({}, "X") == 0.0
+    assert crm.project_threshold_bump({"per_project": {}}, "X") == 0.0
+    assert crm.project_threshold_bump({"per_project": {"X": {}}}, "X") == 0.0
+
+
+def test_project_threshold_bump_custom_thresholds():
+    """min_surfaced/bump overrides are honored."""
+    import cross_recall_metrics as crm
+    metrics = {"per_project": {"P": {"surfaced": 10, "engaged": 0}}}
+    assert crm.project_threshold_bump(metrics, "P", min_surfaced=10, bump=0.05) == 0.05
+    assert crm.project_threshold_bump(metrics, "P", min_surfaced=11) == 0.0

@@ -44,6 +44,15 @@ GEMINI_TASKS = CLAUDE / "gemini-tasks"
 RESEARCH_BASE = Path(r"{{RESEARCH_PATH}}\General Research")
 RESEARCH_TRANSCRIPTS = RESEARCH_BASE / "raw" / "transcripts"
 
+# hook_telemetry lives alongside this script; import defensively so a missing/
+# broken sibling module never breaks the dashboard (tolerant-loader pattern).
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+try:
+    from hook_telemetry import summarize as _summarize_hook_telemetry
+except Exception:
+    _summarize_hook_telemetry = None
+
 PYEXE = sys.executable or "python"
 
 # Whitelisted actions: key -> (label, argv). NO user input ever reaches the shell.
@@ -66,6 +75,20 @@ def _load(path: Path, default=None):
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception:
         return default if default is not None else {}
+
+
+def _load_hook_telemetry() -> dict:
+    """Per-hook 7d aggregates (count/error_rate/p50/p95) from hook-telemetry.jsonl.
+
+    Tolerant: missing module, missing log, or corrupt lines all degrade to {}
+    (hook_telemetry.summarize() already skips corrupt lines internally).
+    """
+    if _summarize_hook_telemetry is None:
+        return {}
+    try:
+        return _summarize_hook_telemetry(window_days=7)
+    except Exception:
+        return {}
 
 
 def _find_entity_files() -> list[dict]:
@@ -97,6 +120,13 @@ def collect_state() -> dict:
     kpi = _load(LOGS / "outcome-kpi.json")
     incidents = _load(LOGS / "incidents.json")
     fixproposals = _load(LOGS / "fix-proposals.json")
+    hook_telemetry = _load_hook_telemetry()
+    # Discipline pulse (weekly producer) + Fable practice mine (dreaming
+    # producer) + dispatcher health — the 2026-07-02 audit found the
+    # DEGRADED canary signal reached no rendered card on either path.
+    discipline = _load(LOGS / "discipline_stats.json")
+    fable_mine = _load(LOGS / "fable-practice-candidates.json")
+    autom_health = _load(LOGS / "health.json")
     # trend: last 10 health snapshots
     trend = []
     hist = LOGS / "selfreg-history.jsonl"
@@ -123,6 +153,9 @@ def collect_state() -> dict:
         "registry": registry, "graphq": graphq, "dreaming": dreaming, "trend": trend,
         "integrity": integrity, "abeval": abeval, "kpi": kpi,
         "incidents": incidents, "fixproposals": fixproposals,
+        "hook_telemetry": hook_telemetry,
+        "discipline": discipline, "fable_mine": fable_mine,
+        "autom_health": autom_health,
         "gemini_briefs": gemini_briefs,
         "research": {"files": research_files, "count": len(research_files)},
         "actions": {k: v[0] for k, v in ACTIONS.items()},
@@ -166,13 +199,19 @@ const gradeColor=(g)=>({A:'var(--ok)',B:'var(--ok)',C:'var(--warn)',D:'var(--bad
 const cards=document.getElementById('cards');
 function card(title,inner,full){const c=$(`<div class="card ${full?'full':''}"><h2>${title}</h2>${inner}</div>`);cards.appendChild(c);}
 
-// Health
+// Health — grade + the actual issue lines + dispatcher run status.
+// The issues/status were collected but never rendered, so a DEGRADED daily
+// run (e.g. the claude_auth_canary 401 streak) was invisible here.
 const h=S.health||{};const g=h.grade||'?';
+const issues=Object.entries(h.issues||{}).flatMap(([k,v])=>(v||[]).map(x=>String(x)));
+const ah=S.autom_health||{};const ahBad=ah.status&&ah.status!=='OK';
 card('Self-Regulation Health',
  `<div style="display:flex;align-items:center;gap:14px">
    <span class="grade" style="background:${gradeColor(g)}22;color:${gradeColor(g)}">${g}</span>
    <div><div class="big">${h.overall??'?'}<span class="mut" style="font-size:14px">/100</span></div>
-   <div class="mut">${(h.components?Object.entries(h.components).map(([k,v])=>k+' '+v).join(' · '):'')}</div></div></div>`);
+   <div class="mut">${(h.components?Object.entries(h.components).map(([k,v])=>k+' '+v).join(' · '):'')}</div></div></div>
+  ${ah.status?`<div class="row" style="margin-top:8px"><span class="mut">Dispatcher ${ah.run_type||''} ${ah.last_run||''}</span><b class="${ahBad?'bad':'ok'}">${ah.status}${(ah.failures&&ah.failures.length)?' — '+ah.failures.join(', '):''}</b></div>`:''}
+  ${issues.length?issues.slice(0,5).map(i=>`<div class="row"><span class="warn" style="font-size:12px">⚠ ${i}</span></div>`).join(''):''}`);
 
 // ROI + cost
 const r=S.roi||{};const dc=(S.dreaming&&S.dreaming.cost)||{};const dcd=(S.dreaming&&S.dreaming.days)||7;
@@ -201,6 +240,21 @@ card('Health Trend',
  t.length?`<div class="spark">${t.map(x=>`<div style="height:${Math.max(3,(x.overall||0))}%" title="${x.date}: ${x.overall}"></div>`).join('')}</div>
   <div class="mut" style="margin-top:6px">${t.length} snapshots · latest ${t[t.length-1].overall}</div>`:'<div class="mut">No trend yet</div>');
 
+// 🧭 Дисциплина — Fable-gap pulse (weekly discipline_analyzer) + practice mine
+// (dreaming fable_practice_miner). Wired 2026-07-02: тези продуценти нямаха
+// нито един рендериран консуматор.
+const dt=(S.discipline||{}).target||{}, db=(S.discipline||{}).baseline||{};
+const fm=S.fable_mine||{};
+const drow=(l,a,b)=>`<div class="row"><span class="mut">${l}</span><b>${a??'?'}%<span class="mut"> vs Fable ${b??'?'}%</span></b></div>`;
+card('🧭 Дисциплина (vs Fable 5)',
+ (dt.model?`<div class="mut" style="margin-bottom:6px">${dt.model} · ${dt.sessions??'?'} сесии</div>`+
+  drow('Reason before act',dt.reason_before_action_pct,db.reason_before_action_pct)+
+  drow('Re-eval after result',dt.reeval_after_result_pct,db.reeval_after_result_pct)+
+  drow('Real test after edit',dt.real_test_after_edit_pct,db.real_test_after_edit_pct)+
+  drow('Batch multi-tool',dt.batch_multi_tool_pct,db.batch_multi_tool_pct)
+  :'<div class="mut">discipline_stats.json липсва — изчаква weekly run</div>')+
+ `<div class="row" style="margin-top:6px"><span class="mut">Fable practice mine</span><b>${fm.records!=null?fm.records+' records · '+Object.keys(fm.theme_hits||{}).length+' теми':'изчаква dreaming'}</b></div>`);
+
 // Integrity guard — "broken ruler" detector; crit/high must be impossible to miss
 const ig=S.integrity||{};
 if(ig.counts){
@@ -216,6 +270,17 @@ if(ig.counts){
    (igTop.length?'<div style="margin-top:8px">'+igTop.map(v=>`<div class="mut" style="font-size:12px">⚠ ${v.check}: ${(v.detail||'').slice(0,90)}</div>`).join('')+'</div>'
     :'<div class="ok" style="margin-top:8px">✓ no critical/high</div>'));
 } else { card('🧮 Integrity','<div class="mut">Run Integrity check to populate</div>'); }
+
+// Hook telemetry — per-hook call volume/error-rate/latency over the last 7d
+// (hook-telemetry.jsonl was write-only until wired here; see hook_telemetry.py)
+const hkt=S.hook_telemetry||{};
+const hkEntries=Object.entries(hkt).sort((a,b)=>(b[1].count||0)-(a[1].count||0));
+if(hkEntries.length){
+  card('🪝 Hook Telemetry (7d)',
+   hkEntries.slice(0,8).map(([name,m])=>
+    `<div class="row"><span class="mut">${name}</span><b>${m.count} <span class="${m.error_rate?'bad':'mut'}" style="font-size:11px">(${Math.round((m.error_rate||0)*100)}% err · p95 ${m.p95_ms}ms)</span></b></div>`
+   ).join(''));
+} else { card('🪝 Hook Telemetry (7d)','<div class="mut">No hook events in window</div>'); }
 
 // A/B eval — did auto-applied rules actually reduce their target complaint rate?
 const ab=S.abeval||{};const absum=ab.summary||null;
@@ -712,10 +777,12 @@ def render(serve: bool) -> str:
                 .replace("__SERVE__", "true" if serve else "false"))
 
 
-def build():
+def build(no_open: bool = False):
     OUT_HTML.parent.mkdir(parents=True, exist_ok=True)
     OUT_HTML.write_text(render(serve=False), encoding="utf-8")
     print(f"Dashboard: {OUT_HTML}")
+    if no_open:
+        return
     try:
         webbrowser.open(OUT_HTML.as_uri())
     except Exception:
@@ -808,11 +875,13 @@ def main():
     ap.add_argument("--build", action="store_true", help="Generate static HTML and open it")
     ap.add_argument("--serve", action="store_true", help="Run localhost server with live buttons")
     ap.add_argument("--port", type=int, default=8723)
+    ap.add_argument("--no-open", action="store_true",
+                     help="With --build: skip opening the browser (unattended/scheduled runs)")
     args = ap.parse_args()
     if args.serve:
         serve(args.port)
     else:
-        build()
+        build(no_open=args.no_open)
 
 
 if __name__ == "__main__":

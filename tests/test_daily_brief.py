@@ -155,3 +155,99 @@ def test_build_brief_gemini_line_in_sistema_section():
     gemini_idx = md.index("📤 2 Gemini brief")
     # Gemini line must come after the section header
     assert gemini_idx > sistema_idx
+
+
+# ── growth pulse + CHECK-beat consumption ─────────────────────────────────────
+
+def _setup_growth(tmp_path, monkeypatch, eval_lines, n_actions=5):
+    """Wire a fake growth project + eval trail into daily_brief's paths."""
+    logs = tmp_path / "logs"; logs.mkdir()
+    skills = tmp_path / "skills" / "growth-loop"; skills.mkdir(parents=True)
+    wiki = tmp_path / "wiki"; wiki.mkdir()
+    out = wiki / "G.md"
+    rows = "".join(f"| {i} | a | l | S | H | http://x |\n" for i in range(1, n_actions + 1))
+    out.write_text(
+        "---\nweek_of: 2026-06-20\nverdict: needs-attention\n---\n"
+        "| # | A | L | E | I | S |\n|---|---|---|---|---|---|\n" + rows,
+        encoding="utf-8",
+    )
+    (skills / "projects.json").write_text(
+        json.dumps({"projects": {"p": {"display_name": "P", "output": str(out)}}}),
+        encoding="utf-8",
+    )
+    (logs / "growth-eval.jsonl").write_text("\n".join(eval_lines) + "\n", encoding="utf-8")
+    monkeypatch.setattr(db, "LOGS", logs)
+    monkeypatch.setattr(db, "SKILLS", skills.parent)
+
+
+def test_growth_pulse_parses_table_actions_and_frontmatter_verdict(tmp_path, monkeypatch):
+    # Regression: actions were parsed from a numbered list, but the file is a table.
+    _setup_growth(tmp_path, monkeypatch, ['{"project":"p","verdict":"PASS","score":1.0}'])
+    p = db._growth_pulses()[0]
+    assert p["actions"] == 5                # table rows counted, not 0
+    assert p["verdict"] == "needs-attention"  # read from frontmatter
+    assert p["check_verdict"] == "PASS"
+    assert p["check_regressed"] is False
+
+
+def test_growth_pulse_single_pass_not_regressed(tmp_path, monkeypatch):
+    _setup_growth(tmp_path, monkeypatch, ['{"project":"p","verdict":"PASS"}'])
+    assert db._growth_pulses()[0]["check_regressed"] is False
+
+
+def test_growth_pulse_detects_sustained_regression(tmp_path, monkeypatch):
+    _setup_growth(tmp_path, monkeypatch, [
+        '{"project":"p","verdict":"PASS"}',
+        '{"project":"p","verdict":"WEAK"}',
+        '{"project":"p","verdict":"FAIL","ok":false}',
+    ])
+    p = db._growth_pulses()[0]
+    assert p["check_verdict"] == "FAIL"
+    assert p["check_regressed"] is True
+    assert p["check_trend"][-2:] == ["WEAK", "FAIL"]
+
+
+def test_growth_pulse_one_good_run_breaks_streak(tmp_path, monkeypatch):
+    _setup_growth(tmp_path, monkeypatch, [
+        '{"project":"p","verdict":"WEAK"}',
+        '{"project":"p","verdict":"PASS"}',
+    ])
+    assert db._growth_pulses()[0]["check_regressed"] is False
+
+
+# ── silenced-not-fixed incidents + hook runtime health lines ─────────────────
+
+def test_build_brief_silenced_line_renders_with_zero_open():
+    # 0 open + N silenced is EXACTLY the blind spot the line exists for.
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [],
+                        incidents=[], silenced_count=4)
+    assert "4 инцидент(а) затворени по замлъкване" in md
+    assert "incident_tracker.py" in md
+
+
+def test_build_brief_no_silenced_line_at_zero():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92}, [], [], {}, 0, [])
+    assert "по замлъкване" not in md
+
+
+def test_build_brief_hook_issues_line():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    health = {"grade": "B", "overall": 85,
+              "issues": {"hooks": ["hook auto_pinecone_save: 40% fail (n=50)"]}}
+    md = db.build_brief(now, health, [], [], {}, 0, [])
+    assert "Hook здраве" in md
+    assert "auto_pinecone_save" in md
+
+
+def test_build_brief_no_hook_line_when_healthy():
+    now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+    md = db.build_brief(now, {"grade": "A", "overall": 92,
+                              "issues": {"hooks": []}}, [], [], {}, 0, [])
+    assert "Hook здраве" not in md
+
+
+def test_item_type_from_id_discipline():
+    assert db._item_type_from_id(
+        "discipline-opus-4-8-abs_path_hygiene_pct") == "discipline_gap"

@@ -35,6 +35,7 @@ from pathlib import Path
 CLAUDE = Path.home() / ".claude"
 SKILLS_DIR = CLAUDE / "skills"
 COMMANDS_DIR = CLAUDE / "commands"
+AGENTS_DIR = CLAUDE / "agents"
 DISPATCHER = CLAUDE / "scripts" / "automation_dispatcher.py"
 WIKI_MAP = Path(r"{{WIKI_PATH}}\_shared\wiki-map.json")
 META = Path(r"{{WIKI_PATH}}\_meta")
@@ -135,6 +136,22 @@ def discover_automations() -> dict:
     return autos
 
 
+def discover_agents() -> dict:
+    """Count the custom subagents by family. Detail lives in AGENT_MAP.md, so we
+    only summarise here. Guarded import — a broken sibling never sinks the
+    registry (this script must never raise)."""
+    try:
+        sys.path.insert(0, str(CLAUDE / "scripts"))
+        from agent_map_gen import collect_agents
+        rows = collect_agents()
+    except Exception:
+        return {"count": 0, "families": {}}
+    fams: dict[str, int] = {}
+    for r in rows:
+        fams[r["family"]] = fams.get(r["family"], 0) + 1
+    return {"count": len(rows), "families": fams}
+
+
 def discover_projects() -> dict:
     wmap = json.loads(_read(WIKI_MAP) or "{}")
     meta = wmap.get("metadata", {})
@@ -184,6 +201,7 @@ def build() -> dict:
     commands = discover_commands()
     automations = discover_automations()
     projects = discover_projects()
+    agents = discover_agents()
 
     domains: dict = {d: {"description": desc, "skills": [], "commands": [],
                          "automations": [], "projects": []}
@@ -208,11 +226,13 @@ def build() -> dict:
         },
         "stats": {
             "skills": len(skills), "commands": len(commands),
+            "agents": agents["count"],
             "automations": len(automations), "active_projects": len(projects),
             "uncategorized": len(domains["uncategorized"]["skills"]
                                  + domains["uncategorized"]["commands"]),
         },
         "domains": domains,
+        "agents_detail": agents,
         "automations_detail": automations,
         "skill_descriptions": skills,
         "automation_candidates": automation_candidates(skills, automations, commands),
@@ -236,7 +256,8 @@ def render_md(reg: dict) -> str:
         "> capability mapped to a domain. Chase AI step 1 — \"architecture\".",
         "",
         f"**Inventory:** {s['skills']} skills · {s['commands']} commands · "
-        f"{s['automations']} automations · {s['active_projects']} active projects"
+        f"{s.get('agents', 0)} agents · {s['automations']} automations · "
+        f"{s['active_projects']} active projects"
         + (f" · ⚠ {s['uncategorized']} uncategorized" if s['uncategorized'] else ""),
         "",
     ]
@@ -256,6 +277,16 @@ def render_md(reg: dict) -> str:
             lines.append(f"- **Commands:** {', '.join('/' + c for c in data['commands'])}")
         if data["skills"]:
             lines.append(f"- **Skills ({len(data['skills'])}):** {', '.join(data['skills'])}")
+        lines.append("")
+
+    # Agents — summary + pointer (full detail in AGENT_MAP.md, not duplicated here)
+    ag = reg.get("agents_detail", {})
+    if ag.get("count"):
+        fam_str = ", ".join(f"{k} {v}" for k, v in sorted(ag["families"].items()))
+        lines.append("## agents")
+        lines.append(f"*{ag['count']} субагента — детайли в `~/.claude/AGENT_MAP.md`; "
+                     "викай през `subagent_type`.*")
+        lines.append(f"- **Families:** {fam_str}")
         lines.append("")
 
     # Automation candidates — the "what to codify next" loop (from dreaming)
@@ -291,8 +322,8 @@ def main() -> None:
         REGISTRY_MD.write_text(render_md(reg), encoding="utf-8")
         s = reg["stats"]
         print(f"agentic_os_registry: {s['skills']} skills, {s['commands']} commands, "
-              f"{s['automations']} automations, {s['active_projects']} projects "
-              f"({s['uncategorized']} uncategorized)")
+              f"{s['agents']} agents, {s['automations']} automations, "
+              f"{s['active_projects']} projects ({s['uncategorized']} uncategorized)")
     except Exception as e:
         print(f"agentic_os_registry error (suppressed): {e}", file=sys.stderr)
     sys.exit(0)

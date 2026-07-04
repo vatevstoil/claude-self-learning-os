@@ -19,6 +19,36 @@ import pytest
 # under the pytest-timeout ceiling — an accidental real call fails, not hangs.
 socket.setdefaulttimeout(10)
 
+# Scripts importable from conftest fixtures (test files each insert this too).
+_SCRIPTS_DIR = Path.home() / ".claude" / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_applied_ledger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """No test may append to the real applied-ledger.jsonl.
+
+    2026-07-02 audit: 59/62 rows in the production ledger were pytest-fixture
+    writes (tests exercising process_accepted paths whose inner
+    record_application call uses the module default), silently skewing the
+    trust-tier precision data that gates auto-apply. record_application now
+    resolves its default at call time, so patching the module constant
+    redirects every writer that didn't inject an explicit path.
+    """
+    import importlib
+    tmp_ledger = tmp_path / "applied-ledger.jsonl"
+    # Every module that binds its own default ledger constant; each resolves
+    # it at CALL time (ledger_path=None pattern) so this patch is effective.
+    for mod_name, attr in (("trust_tiers", "_DEFAULT_LEDGER"),
+                           ("boris_draft", "_DEFAULT_LEDGER"),
+                           ("habit_to_skill", "_DEFAULT_LEDGER_AA")):
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+        monkeypatch.setattr(mod, attr, tmp_ledger, raising=False)
+
 # ---------------------------------------------------------------------------
 # Canonical real log path — must match automation_dispatcher.LOG_FILE exactly.
 # We resolve it here once so the fixture never imports the module prematurely.

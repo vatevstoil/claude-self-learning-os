@@ -20,8 +20,8 @@ project detection from path).
 
 ```
 Base:         <from KB_CONFIG.md or argument>
-Raw:          raw/transcripts/*.md
-Registry:     raw/processed.json
+Raw:          {raw_dir}/*.md          (default: raw/transcripts — see Step 0)
+Registry:     {registry_path}         (default: raw/processed.json)
 Summaries:    wiki/summaries/<Name>.md
 Index:        wiki/index.md
 Hot cache:    wiki/hot.md
@@ -37,10 +37,20 @@ Read `KB_CONFIG.md` in the base directory to get:
 ```
 base_path:        {{RESEARCH_PATH}}\<Project>\
 notebooklm_id:    <UUID>
+raw_dir:          <path relative to base, default "raw/transcripts">
+registry_path:    <path relative to base, default "raw/processed.json">
 categories:       <routing table — what content maps to which category>
 ```
 
-If no `KB_CONFIG.md` exists → look for `CLAUDE.md` with a similar structure.
+**`raw_dir` and `registry_path` are per-project overrides.** Most projects use the
+default `raw/transcripts` / `raw/processed.json` unchanged. Some projects (e.g. AI
+Video) set `raw_dir: _raw/transcripts` explicitly in their KB_CONFIG.md — always use
+whatever `raw_dir`/`registry_path` the config specifies for THIS base, never assume
+the default. Every `{raw_dir}` / `{registry_path}` reference below means "the value
+resolved in this step," not the literal string `raw/transcripts`.
+
+If no `KB_CONFIG.md` exists → look for `CLAUDE.md` with a similar structure, and fall
+back to the defaults above.
 
 If the user provides a path argument → use that as base.
 
@@ -59,9 +69,9 @@ If the user provides a path argument → use that as base.
 ```python
 import json, os
 
-registry = json.load(open(base + "raw/processed.json"))
+registry = json.load(open(base + registry_path))   # registry_path from Step 0
 processed = {e["raw_file"] for e in registry["processed"]}
-all_raw   = {f for f in os.listdir(base + "raw/transcripts/") if f.endswith(".md")}
+all_raw   = {f for f in os.listdir(base + raw_dir + "/") if f.endswith(".md")}  # raw_dir from Step 0
 delta     = sorted(all_raw - processed)
 ```
 
@@ -76,7 +86,7 @@ delta     = sorted(all_raw - processed)
 
 ### 2a. Read the file
 ```
-Read("<base>/raw/transcripts/<filename>")
+Read("<base>/{raw_dir}/<filename>")
 ```
 If >10,000 tokens: read in parts (offset + limit 200 lines).
 
@@ -116,7 +126,7 @@ last_updated: <today>
 > Type: YouTube Transcript Summary / Research Summary / Instruction File
 > Date: <today>
 > Author/Channel: <author>
-> Source: `raw/transcripts/<filename>`
+> Source: `{raw_dir}/<filename>`
 
 ---
 
@@ -248,7 +258,7 @@ If 403 error → `mcp__notebooklm__refresh_auth()` → if still fails → run `n
 
 ## Step 4: Update Registry
 
-Update `raw/processed.json`:
+Update `{registry_path}`:
 
 ```json
 // Add to "processed":

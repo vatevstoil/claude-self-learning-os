@@ -1,6 +1,6 @@
 ---
 name: fix-flow
-description: "Safe, project-aware fix workflow for the 4-layer ecosystem. Enforces impact-check BEFORE editing, surgical change, verify AFTER, and logs the gotcha — so fixes don't break other things and the lesson is captured. Use when the user says 'поправи', 'оправи', 'fix this', 'счупи се', 'fix the bug/error', or asks to fix anything in a project under {{CODE_PATH}}. NOT for finding an unknown root cause (use systematic-debugging first), NOT for bulk regex edits across many files (use bulk-fixer)."
+description: "Safe, project-aware fix workflow for the 4-layer ecosystem. Enforces impact-check BEFORE editing, surgical change, verify AFTER, and logs the gotcha — so fixes don't break other things and the lesson is captured. Use when the user says 'поправи', 'оправи', 'fix this', 'счупи се', 'fix the bug/error', or asks to fix anything in a project under {{CODE_PATH}}. NOT for finding an unknown root cause (use systematic-debugging first)."
 ---
 
 # fix-flow — Safe project fix workflow
@@ -16,9 +16,6 @@ is unknown, run `systematic-debugging` first, then come back here to apply the f
 |-----------|-----|
 | Known fix to apply in a project | **fix-flow** (this) |
 | Unknown root cause / mysterious bug | `systematic-debugging` first |
-| Same edit across 5+ files (regex) | `bulk-fixer` |
-| Enum/status drift across layers | `enum-sync-checker` |
-| Pre-deploy gate | `pre-deploy-check` |
 
 ## The 5 steps (do them in order, don't skip)
 
