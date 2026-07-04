@@ -294,3 +294,32 @@ def test_project_threshold_bump_custom_thresholds():
     metrics = {"per_project": {"P": {"surfaced": 10, "engaged": 0}}}
     assert crm.project_threshold_bump(metrics, "P", min_surfaced=10, bump=0.05) == 0.05
     assert crm.project_threshold_bump(metrics, "P", min_surfaced=11) == 0.0
+
+
+def test_silent_top_p50_from_near_miss_events(tmp_path, monkeypatch):
+    """Silent events with top_score feed the near-miss median; legacy rows skip."""
+    now = datetime.now(timezone.utc)
+    ts = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    rows = [
+        {"ts": ts, "project": "P", "enriched": False, "surfaced": [], "top_score": 0.58},
+        {"ts": ts, "project": "P", "enriched": False, "surfaced": [], "top_score": 0.62},
+        {"ts": ts, "project": "P", "enriched": False, "surfaced": []},  # legacy row
+    ]
+    crm = _setup(tmp_path, monkeypatch, rows, {})
+    m = crm.compute(days=30, now=now)
+    assert m["silent_events"] == 3
+    assert m["silent_top_p50"] == 0.62  # median of [0.58, 0.62] -> upper mid
+
+
+def test_silent_top_p50_zero_when_no_scored_silent_events(tmp_path, monkeypatch):
+    """Only legacy silent rows (no top_score) -> 0.0, and surfaced events don't count."""
+    now = datetime.now(timezone.utc)
+    ts = (now - timedelta(days=1)).isoformat(timespec="seconds")
+    rows = [
+        {"ts": ts, "project": "P", "enriched": False, "surfaced": []},
+        {"ts": ts, "project": "P", "enriched": False, "top_score": 0.9,
+         "surfaced": [{"ns": "_shared", "id": "v1", "score": 0.9, "hc0": 0}]},
+    ]
+    crm = _setup(tmp_path, monkeypatch, rows, {})
+    m = crm.compute(days=30, now=now)
+    assert m["silent_top_p50"] == 0.0

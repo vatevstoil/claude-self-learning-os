@@ -181,6 +181,16 @@ def compute(days: int, now: datetime | None = None) -> dict:
     n_silent = sum(1 for e in events if not e.get("surfaced"))
     n_enriched = sum(1 for e in events if e.get("enriched"))
 
+    # Near-miss telemetry: best raw score of events that surfaced nothing.
+    # A silent channel whose silent_top_p50 sits just under the threshold
+    # means the bar is miscalibrated, not that the corpus has no matches
+    # (exactly the 06-24..07-04 failure mode). Legacy events without the
+    # top_score field are skipped.
+    silent_top = sorted(
+        float(e["top_score"]) for e in events
+        if not e.get("surfaced")
+        and isinstance(e.get("top_score"), (int, float)))
+
     surfaced = [s for e in events for s in (e.get("surfaced") or [])]
     n_surfaced = len(surfaced)
 
@@ -236,6 +246,7 @@ def compute(days: int, now: datetime | None = None) -> dict:
         "window_days": days,
         "events": n_events,
         "silent_events": n_silent,
+        "silent_top_p50": round(silent_top[len(silent_top) // 2], 4) if silent_top else 0.0,
         "enriched_pct": round(100 * n_enriched / n_events, 1) if n_events else 0.0,
         "surfaced": n_surfaced,
         "avg_score": round(sum(scores) / len(scores), 4) if scores else 0.0,

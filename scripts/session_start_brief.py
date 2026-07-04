@@ -314,13 +314,16 @@ def main() -> None:
 
                 # (b) cross-project layers — surface top high-signal lessons
                 # bge-m3 cosine scores run lower than e5's — calibrate the
-                # high-signal threshold per backend (e5≈0.82, bge-m3≈0.66).
-                # Raised 0.60→0.66 (2026-06-24): at 0.60 engagement was 2.1%
-                # (avg surfaced score 0.74; higgsfield alone dumped 90 surfaced
-                # / 0 engaged — pure noise). 0.66 trims the low-signal tail
-                # without silencing surfacing. Re-tune from
-                # cross-recall-metrics.json (avg_score/per_project) if it drifts.
-                _XTHRESH = 0.66 if _lr is not None else 0.82
+                # high-signal threshold per backend (e5≈0.82, bge-m3≈0.60).
+                # History: 0.60→0.66 (2026-06-24) was calibrated on e5-era data
+                # (avg 0.74) DURING the session-hook outage, so it never saw
+                # live traffic; measured bge-m3 distribution (2026-07-04):
+                # relevant top hits score 0.55-0.67, so 0.66 silenced the
+                # channel for 3 weeks. Back to 0.60: noisy projects are
+                # suppressed per-project by project_threshold_bump below, not
+                # by the global bar. Re-tune from cross-recall-metrics.json
+                # (silent_top_p50 tracks near-miss drift).
+                _XTHRESH = 0.60 if _lr is not None else 0.82
                 # Per-project suppression decay: a project chronically surfaced
                 # with zero engagement (e.g. higgsfield.ai: 90 surfaced / 0
                 # engaged) gets a higher bar next time. Self-correcting — the
@@ -344,9 +347,16 @@ def main() -> None:
                 def _do_query_typed(ns, vec, topk):
                     """Query with type_filter on local backend; post-filter for cloud."""
                     if _lr is not None:
+                        # local_rag returns text as a TOP-LEVEL field, not inside
+                        # meta — fold it into metadata so the render loop below
+                        # (which reads metadata.text, the cloud shape) sees it.
+                        # Without this every local hit rendered as empty text and
+                        # was skipped: hits above threshold still surfaced NOTHING.
                         return [
                             {"id": h["id"], "score": h["score"],
-                             "metadata": h.get("meta", {})}
+                             "metadata": {**(h.get("meta") or {}),
+                                          "text": h.get("text")
+                                          or (h.get("meta") or {}).get("text", "")}}
                             for h in _lr.query_vec(
                                 vec, namespaces=[ns], topk=topk,
                                 type_filter=list(_MEANINGFUL_TYPES),
@@ -360,12 +370,18 @@ def main() -> None:
                     ][:topk]
 
                 _xhits = []
+                # Raw best score incl. sub-threshold hits — without it a silent
+                # channel is undiagnosable from the log (needs a manual probe).
+                _top_seen = 0.0
                 for _xns in ("_shared", "_claude_meta"):
                     if _xns == _ns:
                         continue
                     try:
                         for _m in _do_query_typed(_xns, _vec, 3):
-                            if _m.get("score", 0) >= _XTHRESH:
+                            _sc = _m.get("score", 0)
+                            if _sc > _top_seen:
+                                _top_seen = _sc
+                            if _sc >= _XTHRESH:
                                 _xhits.append((_xns, _m))
                     except Exception:
                         continue
@@ -396,7 +412,8 @@ def main() -> None:
                         _s["hc0"] = int(_rtd.get(_s.get("id") or "", {}).get("hit_count", 0))
                     _rec = {"ts": _dt.now(_tz.utc).isoformat(timespec="seconds"),
                             "project": project, "enriched": _qtext != project,
-                            "surfaced": _shown}
+                            "surfaced": _shown,
+                            "top_score": round(_top_seen, 4)}
                     with (LOGS / "cross-recall-surfaced.jsonl").open("a", encoding="utf-8") as _f:
                         _f.write(_json.dumps(_rec, ensure_ascii=False) + "\n")
                 except Exception:
