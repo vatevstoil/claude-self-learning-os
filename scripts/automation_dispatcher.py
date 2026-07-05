@@ -73,6 +73,13 @@ def run_safe(script_path: Path, args: list[str], timeout: int = 300) -> bool:
     that hides real failures.
     """
     name = script_path.name
+    # Optional-script guard: the dispatcher orchestrates a superset of scripts;
+    # ones not shipped in a given install must degrade to a logged skip, not an
+    # rc=2 "can't open file" error that falsely tanks the health grade. Mirrors
+    # the _safe() no-op philosophy for missing sibling modules.
+    if not script_path.exists():
+        log.info("%s: skipped (not installed)", name)
+        return True
     cmd = [sys.executable, str(script_path)] + args
     log.info("Starting: %s args=%s", name, args)
     try:

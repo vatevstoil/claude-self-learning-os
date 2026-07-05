@@ -25,7 +25,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import promotion_apply as pa
+try:
+    import promotion_apply as pa
+except ModuleNotFoundError:
+    # Optional dependency not shipped in this install. Auto-promotion is a
+    # convenience layer over the weekly learning_promoter; degrade to a clean
+    # no-op rather than crash the daily cycle (mirrors run_safe's skip policy).
+    pa = None
 
 PENDING_FILE = Path.home() / ".claude" / "logs" / "promotions-pending.md"
 LOG_FILE = Path.home() / ".claude" / "logs" / "promotion-auto.log"
@@ -104,6 +110,9 @@ def main() -> None:
     p.add_argument("--min-projects", type=int, default=AUTO_MIN_PROJECTS)
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+    if pa is None:
+        _log("promotion_apply not installed — auto-promotion skipped (weekly learning_promoter handles it)")
+        sys.exit(0)
     try:
         run(args.min_confidence, args.min_projects, args.dry_run)
     except Exception as e:

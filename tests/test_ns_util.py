@@ -84,11 +84,10 @@ def test_genuine_cyrillic_not_misrepaired():
 def test_research_wiki_alias_convergence():
     from ns_util import sanitize_ns
     # Hook-side map values and natural transliteration must converge on the
-    # SAME canonical ns, else save and recall fragment.
-    # 2026-07-03: Stoil aliases merged into canonical "{{PRIVATE_NS}}" (walled in
-    # visibility_guard alongside the legacy names).
-    assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
-    assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
-    assert sanitize_ns("{{PRIVATE_NS}}") == "{{PRIVATE_NS}}"
-    assert sanitize_ns("Delo-Zoya") == "{{PRIVATE_NS}}"
+    # SAME canonical ns, else save and recall fragment. Assert the convergence
+    # PROPERTY with in-the-clear aliases (private names are walled in
+    # visibility_guard and redaction-filled per install, so they are not tested
+    # here — that kept this test green only in a filled checkout).
     assert sanitize_ns("Petar-Danov") == "PetarDanov"
+    assert sanitize_ns("Claude-Trading") == sanitize_ns("Claude Trading")
+    assert sanitize_ns(sanitize_ns("Petar-Danov")) == "PetarDanov"  # idempotent

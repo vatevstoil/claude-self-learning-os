@@ -166,6 +166,23 @@ def _do_save(namespace, entry_id, text, meta: dict) -> None:
                 reason = "unknown"
             raise GuardBlockedError(reason)
         return
+    # Storage-layer guard on the Pinecone path too (design intent: see
+    # local_rag.guard_reason docstring "so callers (pinecone.py save) can report
+    # WHICH guard refused"). Without this, MEMORY_BACKEND=pinecone embeds+upserts
+    # credential/PII content straight to the cloud, bypassing the guard the local
+    # backend enforces — a privacy fail-open.
+    reason = None
+    try:
+        from local_rag import guard_reason
+        reason = guard_reason(text)
+    except Exception:
+        try:
+            from pii_scanner import should_block_ingest  # fail-closed fallback
+            reason = "pii" if should_block_ingest(text) else None
+        except Exception:
+            reason = None
+    if reason:
+        raise GuardBlockedError(reason)
     vec = embed(text, is_query=False)
     _req(
         f"https://{HOST}/vectors/upsert",

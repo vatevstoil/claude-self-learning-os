@@ -630,6 +630,12 @@ class TestRunAll:
         drafts = tmp_path / "skill-drafts"
         (drafts / "real-skill").mkdir(parents=True)
 
+        # Isolate the discipline-loop check to tmp (else it reads the real
+        # ~/.claude/logs/discipline_stats.json, absent on a fresh clone).
+        discipline_stats = tmp_path / "discipline_stats.json"
+        discipline_stats.write_text(json.dumps({"model": "sonnet", "sequence": {}}),
+                                    encoding="utf-8")
+
         report = run_all(
             drafts_dir=drafts,
             thresholds_path=thresholds,
@@ -639,6 +645,7 @@ class TestRunAll:
             incidents_path=inc,
             fix_proposals_path=fp,
             queue_path=queue,
+            discipline_stats_path=discipline_stats,
         )
         assert report["violations"] == []
         assert sum(report["counts"].values()) == 0
